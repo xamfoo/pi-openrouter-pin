@@ -1,0 +1,35 @@
+{
+  "id": "z-ai/glm-5.2",
+  "name": "Z.ai: GLM 5.2",
+  "context_length": 1048576,
+  "top_provider": {
+    "id": "novita",
+    "name": "Novita AI",
+    "max_completion_tokens": 128000
+  },
+  "per_request_limits": {
+    "max_tokens": 65536
+  },
+  "pricing": {
+    "prompt": "0.1",
+    "completion": "0.31",
+    "input_cache_read": "0.02",
+    "input_cache_write": "0",
+    "web_search": "0"
+  },
+  "architecture": {
+    "input_modalities": ["text"],
+    "input_token_limit": 1048576
+  },
+  "supported_parameters": [
+    "reasoning",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "stop",
+    "frequency_penalty",
+    "presence_penalty",
+    "logprobs",
+    "top_logprobs"
+  ]
+}

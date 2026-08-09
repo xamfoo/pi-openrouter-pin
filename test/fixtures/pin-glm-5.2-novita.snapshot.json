@@ -1,0 +1,59 @@
+{
+  "providerName": "openrouter-novita",
+  "modelConfig": {
+    "id": "z-ai/glm-5.2",
+    "name": "GLM 5.2 (novita)",
+    "reasoning": true,
+    "input": ["text"],
+    "contextWindow": 1048576,
+    "maxTokens": 128000,
+    "cost": {
+      "input": 100000,
+      "output": 310000,
+      "cacheRead": 20000,
+      "cacheWrite": 0
+    },
+    "compat": {
+      "thinkingFormat": "openrouter",
+      "openRouterRouting": {
+        "only": ["novita"],
+        "allow_fallbacks": false,
+        "quantizations": ["fp8"]
+      }
+    }
+  },
+  "providerEntry": {
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "api": "openai-completions",
+    "apiKey": "$OPENROUTER_API_KEY",
+    "models": [
+      {
+        "id": "z-ai/glm-5.2",
+        "name": "GLM 5.2 (novita)",
+        "reasoning": true,
+        "input": ["text"],
+        "contextWindow": 1048576,
+        "maxTokens": 128000,
+        "cost": {
+          "input": 100000,
+          "output": 310000,
+          "cacheRead": 20000,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "thinkingFormat": "openrouter",
+          "openRouterRouting": {
+            "only": ["novita"],
+            "allow_fallbacks": false,
+            "quantizations": ["fp8"]
+          }
+        }
+      }
+    ]
+  },
+  "settingsPatch": {
+    "defaultProvider": "openrouter-novita",
+    "defaultModel": "z-ai/glm-5.2",
+    "enabledModel": "openrouter-novita/z-ai/glm-5.2"
+  }
+}
