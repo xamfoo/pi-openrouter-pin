@@ -54,9 +54,16 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
       - name: Tag version
         id: tag
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
         run: |
           VERSION="v$(node -p "require('./package.json').version")"
           PKG_VERSION="${VERSION#v}"
@@ -67,10 +74,9 @@ jobs:
           fi
           if ! git rev-parse -q --verify "refs/tags/$VERSION" > /dev/null; then
             git tag "$VERSION"
-            git push origin "$VERSION"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
