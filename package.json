@@ -1,13 +1,20 @@
 {
   "name": "@xamfoo/pi-openrouter-pin",
-  "version": "0.0.0",
+  "version": "0.0.1-next.0",
   "description": "Pi extension to pin an OpenRouter model to a provider.",
   "type": "module",
-  "keywords": ["pi-package", "openrouter", "routing", "pi"],
+  "keywords": [
+    "pi-package",
+    "openrouter",
+    "routing",
+    "pi"
+  ],
   "license": "MIT",
   "author": "pi-openrouter-pin contributors",
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -21,5 +28,9 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"test/*.test.ts\""
   },
-  "files": ["src", "README.md", "LICENSE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
 }
