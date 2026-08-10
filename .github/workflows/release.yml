@@ -19,19 +19,30 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: 24.x
+          node-version: '24'
           registry-url: https://registry.npmjs.org/
-
+          package-manager-cache: false
       - run: npm ci
-
       - name: Publish to npm
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          PKG_NAME="$(node -p "require('./package.json').name")"
+          if [[ "$PKG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\+.*)?$ ]]; then
+            CURRENT_LATEST="$(npm view "$PKG_NAME" dist-tags.latest 2>/dev/null || true)"
+            if [ -z "$CURRENT_LATEST" ] || [ "$(printf '%s\n' "$CURRENT_LATEST" "$PKG_VERSION" | sort -V | tail -n1)" = "$PKG_VERSION" ]; then
+              echo "Publishing release $PKG_VERSION to latest"
+              npm publish --provenance --access public
+            else
+              echo "Publishing release $PKG_VERSION (older than latest $CURRENT_LATEST) to next"
+              npm publish --provenance --access public --tag next
+            fi
+          else
+            echo "Publishing prerelease $PKG_VERSION to next"
+            npm publish --provenance --access public --tag next
+          fi
 
   release:
     runs-on: ubuntu-latest
