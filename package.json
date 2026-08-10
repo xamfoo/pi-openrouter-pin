@@ -10,6 +10,10 @@
     "pi"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xamfoo/pi-openrouter-pin.git"
+  },
   "author": "pi-openrouter-pin contributors",
   "pi": {
     "extensions": [
