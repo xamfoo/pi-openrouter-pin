@@ -1,6 +1,6 @@
 {
   "name": "@xamfoo/pi-openrouter-pin",
-  "version": "0.0.1-rc.1",
+  "version": "0.0.1-rc.2",
   "description": "Pi extension to pin an OpenRouter model to a provider.",
   "type": "module",
   "keywords": [
@@ -10,6 +10,10 @@
     "pi"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xamfoo/pi-openrouter-pin.git"
+  },
   "author": "pi-openrouter-pin contributors",
   "pi": {
     "extensions": [
