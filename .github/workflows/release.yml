@@ -50,16 +50,21 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - name: Generate a token
         id: generate-token
         uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+      - uses: actions/checkout@v6
+        with:
+          # Check out as the app
+          token: ${{ steps.generate-token.outputs.token }}
+          fetch-depth: 0
+          fetch-tags: true
+          # Don't persist the default GITHUB_TOKEN in the local git config
+          persist-credentials: false
       - name: Tag version
         id: tag
         env:
@@ -80,6 +85,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Use the app token
+          token: ${{ steps.generate-token.outputs.token }}
           tag_name: ${{ steps.tag.outputs.version }}
           prerelease: ${{ steps.tag.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
