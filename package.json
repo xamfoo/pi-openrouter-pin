@@ -1,13 +1,20 @@
 {
-  "name": "pi-openrouter-pin",
-  "version": "0.1.0",
-  "description": "Pin OpenRouter models to specific providers (novita, together, …) as persistent, pi-native provider entries in models.json",
+  "name": "@xamfoo/pi-openrouter-pin",
+  "version": "0.0.1-rc.0",
+  "description": "Pi extension to pin an OpenRouter model to a provider.",
   "type": "module",
-  "keywords": ["pi-package", "openrouter", "routing", "pi"],
+  "keywords": [
+    "pi-package",
+    "openrouter",
+    "routing",
+    "pi"
+  ],
   "license": "MIT",
   "author": "pi-openrouter-pin contributors",
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -17,8 +24,13 @@
     "@types/node": "^24.0.0"
   },
   "scripts": {
+    "prepublishOnly": "npm run typecheck && npm test",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"test/*.test.ts\""
   },
-  "files": ["src", "test", "README.md", "LICENSE"]
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
 }
