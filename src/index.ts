@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient } from "./api.ts";
 import { parsePinArgs } from "./args.ts";
 import { makePinCompletions } from "./completions.ts";
-import { formatRouting, listPins, performPin, performUnpin, refreshPinnedModels } from "./commands.ts";
+import { formatRouting, formatRefreshDiff, listPins, performPin, performUnpin, refreshPinnedModels } from "./commands.ts";
 import { providerNameFor } from "./config.ts";
 import { pickFromList } from "./ui.ts";
 import { runWizard } from "./wizard.ts";
@@ -44,11 +44,13 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
   // Fire-and-forget so startup is never blocked; failures are logged, not
   // swallowed. New values apply on the next /reload, which re-fires
   // session_start.
-  pi.on("session_start", (_event) => {
-    void refreshPinnedModels(modelsPath, client)
+  pi.on("session_start", (_event, ctx) => {
+    void refreshPinnedModels(modelsPath, client, () => resolveOpenRouterApiKey(ctx.modelRegistry))
       .then((r) => {
         if (r.refreshed > 0) {
           console.log(`[openrouter-pin] refreshed ${r.refreshed} pinned model pricing & limits — /reload to apply`);
+          const diff = formatRefreshDiff(r.diff);
+          if (diff) console.log(diff);
         } else if (r.failed.length > 0) {
           console.warn(`[openrouter-pin] pricing & limits refresh unavailable for ${r.failed.length} model(s): ${r.failed.join(", ")}`);
         }

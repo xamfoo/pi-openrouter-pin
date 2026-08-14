@@ -467,6 +467,50 @@ test("full flow: strict routing + custom name, no default → plain provider nam
   });
 });
 
+test("full flow: a validated endpoint's provider-specific pricing is recorded, not the catalog aggregate", async () => {
+  // Reproduces the glm-5.2/novita bug end-to-end through the wizard →
+  // performPin path: validateEndpoint returns the novita endpoint, so the
+  // written pin must carry novita's prices (0.74/2.33/0.14, maxTokens 131072),
+  // not the catalog aggregate (1.19/3.74/0.22, maxTokens 128000 here).
+  const novitaEndpoint = {
+    provider_name: "Novita",
+    quantization: "fp8",
+    context_length: 1_048_576,
+    max_completion_tokens: 131_072,
+    pricing: { prompt: "0.0000007406", completion: "0.0000023276", input_cache_read: "0.00000013754" },
+  };
+  await withTempDir(
+    {
+      catalog: [glmRaw()],
+      endpoints: [novitaEndpoint],
+      apiKey: "test-key",
+      validateEndpoint: async () => ({ status: "ok", quant: "fp8", endpoint: novitaEndpoint }),
+    },
+    async (modelsPath, settingsPath, h) => {
+      const started = h.start(modelsPath, settingsPath);
+      await settle();
+      await pickModel(h);
+      await pickFirst(h); // provider → novita
+      h.press("fp8");
+      h.press("enter"); // quant → fp8
+      await settle();
+      h.press("enter"); // name (prefill kept)
+      await settle();
+      h.press("strict");
+      h.press("enter"); // routing → strict
+      await settle();
+      h.press("enter"); // default → yes
+      await settle();
+      await started;
+
+      const models = await readJsonFile<ModelsJson>(modelsPath);
+      const m = models!.providers!["openrouter-novita"].models[0];
+      assert.deepEqual(m.cost, { input: 0.74, output: 2.33, cacheRead: 0.14, cacheWrite: 0 });
+      assert.equal(m.maxTokens, 131_072);
+    },
+  );
+});
+
 test("custom routing inserts Order/Ignore/Data steps and builds the full result", async () => {
   await withTempDir(
     {

@@ -6,7 +6,7 @@
  * process, and tests each get independent state.
  */
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { slugify, type RawModelShape } from "./config.ts";
+import { slugify, type RawEndpointShape, type RawModelShape } from "./config.ts";
 import { readJsonFile, type ModelsJson } from "./files.ts";
 
 export const OR_BASE_URL = "https://openrouter.ai/api/v1";
@@ -20,11 +20,8 @@ export const SEARCH_CACHE_TTL_MS = 30_000;
 
 export type RawModel = RawModelShape;
 
-export interface RawEndpoint {
-  name?: string;
-  provider_name?: string;
-  quantization?: string;
-}
+/** A single endpoint from /models/<id>/endpoints (provider-specific pricing & limits). */
+export type RawEndpoint = RawEndpointShape;
 
 export interface EndpointsResult {
   endpoints: RawEndpoint[];
@@ -45,7 +42,7 @@ export interface EndpointsResult {
  * `fetchUserModelIds` returns `null` for unknown (see item 6 convention).
  */
 export type EndpointValidation =
-  | { status: "ok"; quant?: string; note?: string }
+  | { status: "ok"; quant?: string; note?: string; endpoint?: RawEndpoint }
   | { status: "unvalidated"; quant?: string; note: string }
   | { status: "error"; message: string };
 
@@ -218,9 +215,12 @@ export class OpenRouterClient {
           message: `provider "${slug}" for ${modelId} has no "${quant}" endpoint. Available quantizations: ${availableQuants.join(", ") || "unspecified"}`,
         };
       }
-      return { status: "ok", quant: exact.quantization ?? quant };
+      // Return the matched endpoint so the pin records its provider-specific
+      // pricing & limits, not the catalog aggregate (which can belong to a
+      // different provider for the same model).
+      return { status: "ok", quant: exact.quantization ?? quant, endpoint: exact };
     }
-    return { status: "ok" };
+    return { status: "ok", endpoint: bySlug[0] };
   }
 }
 
