@@ -13,11 +13,16 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   buildPin,
+  findEndpoint,
+  mergeEndpointCost,
+  pricingAndLimitsFromEndpoint,
   providerNameFor,
   slugify,
   stripLegacyAttribution,
   toCost,
   toModelConfig,
+  toPricingAndLimits,
+  type RawEndpointShape,
   type RawModelShape,
 } from "../src/config.ts";
 
@@ -140,6 +145,30 @@ test("buildPin: relaxed pins get a -plus provider name", () => {
   assert.equal(pin.providerEntry.models[0].compat.openRouterRouting.allow_fallbacks, true);
 });
 
+test("buildPin: an endpoint supplies provider-specific pricing & limits (the glm-5.2/novita fix)", () => {
+  // Without an endpoint, the pin records the catalog aggregate (SiliconFlow's
+  // prices for glm-5.2) — the bug.
+  const noEndpoint = buildPin(raw, { modelId: "z-ai/glm-5.2", slug: "novita", quant: "fp8", isDefault: false }, []);
+  assert.deepEqual(noEndpoint.modelConfig.cost, { input: 100000, output: 310000, cacheRead: 20000, cacheWrite: 0 });
+  assert.equal(noEndpoint.modelConfig.maxTokens, 128000);
+
+  // With the validated novita endpoint, the pin records novita's real prices.
+  const novita: RawEndpointShape = {
+    provider_name: "Novita",
+    quantization: "fp8",
+    context_length: 1_048_576,
+    max_completion_tokens: 131_072,
+    pricing: { prompt: "0.0000007406", completion: "0.0000023276", input_cache_read: "0.00000013754" },
+  };
+  const pin = buildPin(raw, { modelId: "z-ai/glm-5.2", slug: "novita", quant: "fp8", isDefault: false, endpoint: novita }, []);
+  assert.deepEqual(pin.modelConfig.cost, { input: 0.74, output: 2.33, cacheRead: 0.14, cacheWrite: 0 });
+  assert.equal(pin.modelConfig.maxTokens, 131_072);
+  // Routing, name, reasoning, and input modalities are unaffected.
+  assert.equal(pin.modelConfig.name, "Z.ai: GLM 5.2 (novita fp8)");
+  assert.equal(pin.modelConfig.reasoning, true);
+  assert.deepEqual(pin.modelConfig.compat.openRouterRouting, { only: ["novita"], allow_fallbacks: false, quantizations: ["fp8"] });
+});
+
 test("toModelConfig: empty/absent name falls back to the generated one, never blank", () => {
   const cfg = toModelConfig(raw, { modelId: "z-ai/glm-5.2", slug: "novita", isDefault: false });
   assert.equal(cfg.name, "Z.ai: GLM 5.2 (novita)");
@@ -155,6 +184,96 @@ test("toCost: per-token pricing converts to per-million-token", () => {
     cacheWrite: 0,
   });
   assert.deepEqual(toCost(undefined), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+});
+
+test("toPricingAndLimits: endpoint overrides the catalog aggregate (provider-specific truth)", () => {
+  // Catalog aggregate (matches SiliconFlow for glm-5.2, not the pinned novita).
+  const snap = toPricingAndLimits(raw);
+  assert.deepEqual(snap.cost, { input: 100000, output: 310000, cacheRead: 20000, cacheWrite: 0 });
+  assert.equal(snap.maxTokens, 128000);
+
+  // A novita endpoint carries its own pricing + limits; those must win.
+  const novita: RawEndpointShape = {
+    provider_name: "Novita",
+    quantization: "fp8",
+    context_length: 1_048_576,
+    max_completion_tokens: 131_072,
+    pricing: { prompt: "0.0000007406", completion: "0.0000023276", input_cache_read: "0.00000013754" },
+  };
+  const pinned = toPricingAndLimits(raw, novita);
+  assert.deepEqual(pinned.cost, { input: 0.74, output: 2.33, cacheRead: 0.14, cacheWrite: 0 });
+  assert.equal(pinned.maxTokens, 131_072, "endpoint max_completion_tokens overrides catalog top_provider");
+  assert.equal(pinned.contextWindow, 1_048_576);
+});
+
+test("toPricingAndLimits: endpoint omits input_cache_write → catalog value is preserved, not zeroed", () => {
+  // A model whose catalog records a nonzero cache-write keeps it when the
+  // endpoint (which never carries input_cache_write) is supplied.
+  const rawWithCacheWrite: RawModelShape = {
+    ...raw,
+    pricing: { prompt: "0.1", completion: "0.31", input_cache_read: "0.02", input_cache_write: "0.05" },
+  };
+  const endpoint: RawEndpointShape = {
+    provider_name: "Novita",
+    pricing: { prompt: "0.0000007406", completion: "0.0000023276", input_cache_read: "0.00000013754" },
+  };
+  assert.equal(toPricingAndLimits(rawWithCacheWrite, endpoint).cost.cacheWrite, 50000, "catalog cacheWrite preserved");
+  // But a present endpoint "0" is honored (distinguished from absent).
+  const endpointWithZero: RawEndpointShape = { ...endpoint, pricing: { ...endpoint.pricing!, input_cache_write: "0" } };
+  assert.equal(toPricingAndLimits(rawWithCacheWrite, endpointWithZero).cost.cacheWrite, 0, "endpoint 0 honored");
+});
+
+test("toPricingAndLimits: endpoint with no pricing falls back to catalog cost", () => {
+  const endpoint: RawEndpointShape = { provider_name: "Novita", context_length: 500_000 };
+  const pinned = toPricingAndLimits(raw, endpoint);
+  assert.deepEqual(pinned.cost, { input: 100000, output: 310000, cacheRead: 20000, cacheWrite: 0 });
+  assert.equal(pinned.contextWindow, 500_000, "endpoint context_length still overrides");
+});
+
+test("mergeEndpointCost: present endpoint keys override, absent keys fall back", () => {
+  const fallback = { input: 100000, output: 310000, cacheRead: 20000, cacheWrite: 50000 };
+  assert.deepEqual(
+    mergeEndpointCost({ pricing: { prompt: "0.2", completion: "0.4" } }, fallback),
+    { input: 200000, output: 400000, cacheRead: 20000, cacheWrite: 50000 },
+  );
+  // No pricing at all → full fallback.
+  assert.deepEqual(mergeEndpointCost({}, fallback), fallback);
+});
+
+test("pricingAndLimitsFromEndpoint: refresh fallback is the stored snapshot", () => {
+  const stored = { contextWindow: 1_048_576, maxTokens: 128_000, cost: { input: 100000, output: 310000, cacheRead: 20000, cacheWrite: 0 } };
+  const endpoint: RawEndpointShape = {
+    provider_name: "Novita",
+    max_completion_tokens: 131_072,
+    pricing: { prompt: "0.0000007406", completion: "0.0000023276", input_cache_read: "0.00000013754" },
+  };
+  assert.deepEqual(pricingAndLimitsFromEndpoint(endpoint, stored), {
+    contextWindow: 1_048_576,
+    maxTokens: 131_072,
+    cost: { input: 0.74, output: 2.33, cacheRead: 0.14, cacheWrite: 0 },
+  });
+  // Endpoint omitting a field keeps the stored value.
+  const partial: RawEndpointShape = { provider_name: "Novita", pricing: { prompt: "0.2" } };
+  assert.deepEqual(pricingAndLimitsFromEndpoint(partial, stored).cost, {
+    input: 200000, output: 310000, cacheRead: 20000, cacheWrite: 0,
+  });
+});
+
+test("findEndpoint: matches slug, then quant; never substitutes another quant's pricing", () => {
+  const endpoints: RawEndpointShape[] = [
+    { provider_name: "SiliconFlow", quantization: "fp8" },
+    { provider_name: "Novita", quantization: "fp4" },
+    { provider_name: "Novita", quantization: "fp8" },
+  ];
+  assert.equal(findEndpoint(endpoints, "novita", "fp8")!.quantization, "fp8");
+  assert.equal(findEndpoint(endpoints, "novita", "fp4")!.quantization, "fp4");
+  // No quant → first endpoint for the slug.
+  assert.equal(findEndpoint(endpoints, "novita")!.quantization, "fp4");
+  // Quant the provider no longer serves → undefined (no substitution).
+  assert.equal(findEndpoint(endpoints, "novita", "bf16"), undefined);
+  // Unknown slug → undefined.
+  assert.equal(findEndpoint(endpoints, "baseten"), undefined);
+  assert.equal(findEndpoint([], "novita"), undefined);
 });
 
 test("slugify: one normalizer for endpoint names and user input", () => {

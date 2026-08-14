@@ -22,6 +22,22 @@ export interface RawModelShape {
   supported_parameters?: string[];
 }
 
+/**
+ * The subset of an OpenRouter /models/<id>/endpoints entry the pin uses.
+ * Endpoint pricing & limits are provider-specific (the catalog's model-level
+ * `pricing` is an aggregate that often belongs to a different provider), so
+ * a pinned provider's recorded cost/limits must come from its endpoint.
+ */
+export interface RawEndpointShape {
+  name?: string;
+  provider_name?: string;
+  quantization?: string;
+  pricing?: Record<string, string>;
+  max_completion_tokens?: number | null;
+  context_length?: number | null;
+  supported_parameters?: string[];
+}
+
 /** The real `openRouterRouting` schema, as accepted by pi's model config. */
 export interface OpenRouterRouting {
   allow_fallbacks?: boolean;
@@ -73,6 +89,15 @@ export interface PinOptions {
   ignore?: string[];
   /** Privacy flag, orthogonal to routing: works on any pin (strict or relaxed). Strict pins surface it as data_collection=… in /openrouter-pins and get a pin-time "routing stays strict" note, since the provider name only reflects routing. */
   dataCollection?: "allow" | "deny";
+  /**
+   * The validated endpoint for the anchor provider (and quant, if any). When
+   * present, pricing & limits are recorded from it — not the catalog aggregate
+   * — so a pin to e.g. novita reflects novita's prices, not whichever provider
+   * the model-level `pricing` happens to summarize. Absent when the endpoint
+   * could not be validated (no API key); the catalog aggregate is then used as
+   * the best available fallback.
+   */
+  endpoint?: RawEndpointShape;
 }
 
 export const COMMON_QUANTIZATIONS = ["none", "fp8", "bf16", "fp16", "int4"];
@@ -109,35 +134,116 @@ export function providerNameFor(
 // Cost / pricing & limits conversion
 // ---------------------------------------------------------------------------
 
+/** OpenRouter per-token USD → pi per-million-token dollars, rounded to 2dp. */
+const perMillion = (s?: string): number => {
+  const v = parseFloat(s ?? "");
+  return Number.isFinite(v) ? Math.round(v * 1_000_000 * 100) / 100 : 0;
+};
+
 /** OpenRouter per-token pricing → pi per-million-token cost, rounded to 2dp. */
 export function toCost(pricing: RawModelShape["pricing"] | undefined): ModelConfig["cost"] {
   const p = pricing ?? {};
-  const num = (s?: string): number => {
-    const v = parseFloat(s ?? "");
-    return Number.isFinite(v) ? Math.round(v * 1_000_000 * 100) / 100 : 0;
-  };
   return {
-    input: num(p.prompt),
-    output: num(p.completion),
-    cacheRead: num(p.input_cache_read),
-    cacheWrite: num(p.input_cache_write),
+    input: perMillion(p.prompt),
+    output: perMillion(p.completion),
+    cacheRead: perMillion(p.input_cache_read),
+    cacheWrite: perMillion(p.input_cache_write),
+  };
+}
+
+/**
+ * Cost from an endpoint's pricing, falling back to the prior cost for keys
+ * the endpoint omits. Endpoint pricing carries prompt/completion/
+ * input_cache_read (and a discount already applied), but not
+ * input_cache_write (a model-level field), so the model-level value is
+ * preserved for it. A present-but-"0" endpoint field is honored (distinguished
+ * from an absent key) so a provider that genuinely charges 0 is recorded as 0.
+ */
+export function mergeEndpointCost(
+  endpoint: RawEndpointShape,
+  fallback: ModelConfig["cost"],
+): ModelConfig["cost"] {
+  const p = endpoint.pricing ?? {};
+  const or = (s: string | undefined, fb: number): number => (s !== undefined ? perMillion(s) : fb);
+  return {
+    input: or(p.prompt, fallback.input),
+    output: or(p.completion, fallback.output),
+    cacheRead: or(p.input_cache_read, fallback.cacheRead),
+    cacheWrite: or(p.input_cache_write, fallback.cacheWrite),
   };
 }
 
 /**
  * The published pricing & limits snapshot of a catalog entry (cost,
- * contextWindow, maxTokens): what a fresh pin would record today. Shared by
- * pin-time config building and the startup refresh so both always agree on
- * the current OpenRouter data.
+ * contextWindow, maxTokens): what a fresh pin would record today. When an
+ * endpoint is supplied (a validated provider for this model), its
+ * provider-specific pricing & limits override the catalog aggregate — the
+ * catalog's model-level `pricing`/`top_provider` summarize a different
+ * provider for some models. Shared by pin-time config building and the
+ * startup refresh so both always agree on per-provider truth.
  */
 export function toPricingAndLimits(
   raw: RawModelShape,
+  endpoint?: RawEndpointShape,
 ): Pick<ModelConfig, "contextWindow" | "maxTokens" | "cost"> {
-  return {
+  const base = {
     contextWindow: raw.context_length ?? 128_000,
     maxTokens: raw.top_provider?.max_completion_tokens ?? raw.per_request_limits?.max_tokens ?? 16_384,
     cost: toCost(raw.pricing),
   };
+  if (!endpoint) return base;
+  return {
+    contextWindow: endpoint.context_length ?? base.contextWindow,
+    maxTokens: endpoint.max_completion_tokens ?? base.maxTokens,
+    cost: endpoint.pricing ? mergeEndpointCost(endpoint, base.cost) : base.cost,
+  };
+}
+
+/**
+ * Pricing & limits for a pinned model from its validated endpoint, falling
+ * back to the previously-stored snapshot for fields the endpoint omits.
+ * Used by the startup refresh, which has no catalog raw in hand — only the
+ * stored pin — so the fallback keeps unchanged fields stable rather than
+ * zeroing them.
+ */
+export function pricingAndLimitsFromEndpoint(
+  endpoint: RawEndpointShape,
+  fallback: Pick<ModelConfig, "contextWindow" | "maxTokens" | "cost">,
+): Pick<ModelConfig, "contextWindow" | "maxTokens" | "cost"> {
+  return {
+    contextWindow: endpoint.context_length ?? fallback.contextWindow,
+    maxTokens: endpoint.max_completion_tokens ?? fallback.maxTokens,
+    cost: endpoint.pricing ? mergeEndpointCost(endpoint, fallback.cost) : fallback.cost,
+  };
+}
+
+/**
+ * The anchor provider slug for a routing policy: the sole `only` provider
+ * for strict pins, or the head of `order` for relaxed ones. Endpoint pricing &
+ * limits are recorded for the anchor, since a pin always means "at least
+ * prefer this provider".
+ */
+export function anchorSlug(routing: OpenRouterRouting | undefined): string | undefined {
+  if (!routing) return undefined;
+  return routing.only?.[0] ?? routing.order?.[0];
+}
+
+/**
+ * Find the endpoint for a provider slug (and optional quantization) among a
+ * model's endpoints. When `quant` is given but no endpoint matches it
+ * exactly, returns undefined (the provider may have dropped that quant)
+ * rather than silently substituting another endpoint's pricing. Without a
+ * quant, the first endpoint for the slug is the representative default.
+ */
+export function findEndpoint(
+  endpoints: RawEndpointShape[],
+  slug: string,
+  quant?: string,
+): RawEndpointShape | undefined {
+  const bySlug = endpoints.filter((e) => slugify(e.provider_name ?? "") === slug);
+  if (bySlug.length === 0) return undefined;
+  if (!quant) return bySlug[0];
+  return bySlug.find((e) => (e.quantization ?? "").toLowerCase() === quant.toLowerCase());
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +275,7 @@ export function toModelConfig(raw: RawModelShape, opts: PinOptions): ModelConfig
   if (ignore.length > 0) routing.ignore = ignore;
   if (opts.quant) routing.quantizations = [opts.quant];
   if (opts.dataCollection) routing.data_collection = opts.dataCollection;
-  const caps = toPricingAndLimits(raw);
+  const caps = toPricingAndLimits(raw, opts.endpoint);
   return {
     id: raw.id,
     name: opts.name ?? `${raw.name ?? raw.id} (${slug}${opts.quant ? ` ${opts.quant}` : ""})`,

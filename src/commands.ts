@@ -7,14 +7,17 @@ import { fuzzyFilter } from "@earendil-works/pi-tui";
 import type { OpenRouterClient, RawModel } from "./api.ts";
 import { PROVIDER_PREFIX } from "./api.ts";
 import {
+  anchorSlug,
   buildPin,
+  findEndpoint,
+  pricingAndLimitsFromEndpoint,
   providerNameFor,
   slugify,
   stripLegacyAttribution,
-  toPricingAndLimits,
   type ModelConfig,
   type OpenRouterRouting,
   type PinOptions,
+  type RawEndpointShape,
 } from "./config.ts";
 import { atomicWriteJson, readJsonFile, type ModelsJson, type ProviderEntry, type SettingsJson } from "./files.ts";
 
@@ -63,7 +66,7 @@ export async function performPin(
     const providerName = providerNameFor(opts.slug, opts);
     const existingEntry = models.providers[providerName];
     const existingModels = existingEntry && Array.isArray(existingEntry.models) ? existingEntry.models : [];
-    const built = buildPin(raw, { ...opts, quant: check.quant }, existingModels);
+    const built = buildPin(raw, { ...opts, quant: check.quant, endpoint: check.status === "ok" ? check.endpoint : undefined }, existingModels);
     // Build the entry WITHOUT relying on spread precedence for headers:
     // `...(existingEntry ?? {})` would re-introduce legacy attribution
     // headers that stripLegacyAttribution just removed (the conditional
@@ -185,6 +188,16 @@ export async function performUnpin(modelsPath: string, modelId: string): Promise
 export interface RefreshResult {
   refreshed: number;
   failed: string[];
+  /** Per-model before → after diff for every pricing/limits change applied. */
+  diff: PricingLimitsDiff[];
+}
+
+/** One model's pricing & limits before → after, for reload-time reporting. */
+export interface PricingLimitsDiff {
+  provider: string;
+  modelId: string;
+  before: { cost: ModelConfig["cost"]; contextWindow: number; maxTokens: number };
+  after: { cost: ModelConfig["cost"]; contextWindow: number; maxTokens: number };
 }
 
 export interface PricingLimitsPatch {
@@ -213,87 +226,179 @@ export function collectRefreshTargets(
 }
 
 /**
- * Pure: diff snapshot targets against the current catalog. Returns the
- * pricing/limits patches for changed models, and the ids that are no longer
- * in the catalog (collected and reported, never thrown).
+ * Pure: the pricing/limits patch for one pinned model, computed from its
+ * validated endpoint (provider-specific truth) rather than the catalog
+ * aggregate. The anchor slug (and stored quant, if any) select the endpoint;
+ * fields the endpoint omits fall back to the stored snapshot so they stay
+ * stable instead of being zeroed. Returns null when there is no matching
+ * endpoint (provider dropped, or quant no longer served) — the stored value
+ * is left untouched rather than clobbered.
  */
-export function computePricingPatches(
-  targets: Array<{ provider: string; model: ModelConfig }>,
-  catalog: RawModel[],
-): { patches: PricingLimitsPatch[]; failed: string[] } {
-  const byId = new Map(catalog.map((m) => [m.id, m]));
-  const patches: PricingLimitsPatch[] = [];
-  const failed: string[] = [];
-  for (const { provider, model } of targets) {
-    const raw = byId.get(model.id);
-    if (!raw) {
-      failed.push(model.id);
-      continue;
-    }
-    const fresh = toPricingAndLimits(raw);
-    const changed =
-      JSON.stringify(fresh.cost) !== JSON.stringify(model.cost) ||
-      fresh.contextWindow !== model.contextWindow ||
-      fresh.maxTokens !== model.maxTokens;
-    if (changed) {
-      patches.push({ provider, modelId: model.id, cost: fresh.cost, contextWindow: fresh.contextWindow, maxTokens: fresh.maxTokens });
-    }
-  }
-  return { patches, failed };
+export function computeEndpointPatch(
+  target: { provider: string; model: ModelConfig },
+  endpoints: RawEndpointShape[],
+): PricingLimitsPatch | null {
+  const routing = target.model.compat?.openRouterRouting;
+  const slug = anchorSlug(routing);
+  if (!slug) return null;
+  const quant = routing!.quantizations?.[0];
+  const endpoint = findEndpoint(endpoints, slug, quant);
+  if (!endpoint || !endpoint.pricing) return null;
+  const fresh = pricingAndLimitsFromEndpoint(endpoint, {
+    contextWindow: target.model.contextWindow,
+    maxTokens: target.model.maxTokens,
+    cost: target.model.cost,
+  });
+  const changed =
+    JSON.stringify(fresh.cost) !== JSON.stringify(target.model.cost) ||
+    fresh.contextWindow !== target.model.contextWindow ||
+    fresh.maxTokens !== target.model.maxTokens;
+  return changed
+    ? { provider: target.provider, modelId: target.model.id, cost: fresh.cost, contextWindow: fresh.contextWindow, maxTokens: fresh.maxTokens }
+    : null;
 }
 
 /**
  * Pure: apply patches to a freshly-read models.json. Providers or models that
  * vanished between the snapshot read and this read (a concurrent unpin) are
- * skipped, never resurrected. Returns the number of models actually patched.
+ * skipped, never resurrected. Returns the number of models actually patched
+ * and a before → after diff for each one (captured from the freshly-read
+ * model, so it reflects what the user actually had on disk, not the stale
+ * snapshot read).
  */
-export function applyPricingPatches(current: ModelsJson | null, patches: PricingLimitsPatch[]): number {
+export function applyPricingPatches(
+  current: ModelsJson | null,
+  patches: PricingLimitsPatch[],
+): { applied: number; diff: PricingLimitsDiff[] } {
   let applied = 0;
+  const diff: PricingLimitsDiff[] = [];
   for (const patch of patches) {
     const provider = current?.providers?.[patch.provider];
     if (!provider || !Array.isArray(provider.models)) continue;
     const model = provider.models.find((m) => m.id === patch.modelId);
     if (!model) continue;
+    const before = { cost: model.cost, contextWindow: model.contextWindow, maxTokens: model.maxTokens };
     model.cost = patch.cost;
     model.contextWindow = patch.contextWindow;
     model.maxTokens = patch.maxTokens;
     applied++;
+    diff.push({ provider: patch.provider, modelId: patch.modelId, before, after: { cost: patch.cost, contextWindow: patch.contextWindow, maxTokens: patch.maxTokens } });
   }
-  return applied;
+  return { applied, diff };
 }
 
 /**
  * Refresh the stored pricing & limits snapshot (cost, contextWindow,
- * maxTokens) of every pinned model from OpenRouter's current catalog. Only
- * those three fields are touched — routing, name, input types, and all other
- * fields are preserved.
+ * maxTokens) of every pinned model from its validated OpenRouter endpoint.
+ * Only those three fields are touched — routing, name, input types, and all
+ * other fields are preserved.
+ *
+ * Per-provider pricing & limits come from /models/<id>/endpoints, not the
+ * catalog aggregate: the catalog's model-level `pricing`/`top_provider`
+ * summarize whichever provider OpenRouter ranks first, which is frequently a
+ * different provider than the pin's anchor (e.g. z-ai/glm-5.2's catalog
+ * pricing matches SiliconFlow, while a novita pin should record novita's
+ * prices). Using the endpoint keeps a provider-specific pin honest.
  *
  * The refresh computes a patch and re-reads models.json at write time, so a
  * pin/unpin that landed between the first read and the write is preserved
- * rather than clobbered by a stale in-memory object. Offline or catalog
- * errors are collected and reported, never thrown.
- *
- * The three phases are pure and exported (collectRefreshTargets,
- * computePricingPatches, applyPricingPatches) so the concurrency guarantee
- * is testable in isolation as well as end-to-end.
+ * rather than clobbered by a stale in-memory object. Without an API key the
+ * endpoints API is unreachable, so refresh is skipped (returning nothing)
+ * rather than overwriting correct per-provider prices with the catalog
+ * aggregate; a model whose endpoints fetch fails is reported as failed, never
+ * thrown. The three phases are pure and exported (collectRefreshTargets →
+ * computeEndpointPatch → applyPricingPatches) so the concurrency guarantee is
+ * testable in isolation as well as end-to-end.
  */
 export async function refreshPinnedModels(
   modelsPath: string,
   client: OpenRouterClient,
+  resolveApiKey: () => Promise<string | undefined>,
 ): Promise<RefreshResult> {
   const snapshot = await readJsonFile<ModelsJson>(modelsPath);
   const targets = collectRefreshTargets(snapshot);
-  if (targets.length === 0) return { refreshed: 0, failed: [] };
+  if (targets.length === 0) return { refreshed: 0, failed: [], diff: [] };
 
-  const catalog = await client.fetchCatalog();
-  const { patches, failed } = computePricingPatches(targets, catalog);
-  if (patches.length === 0) return { refreshed: 0, failed };
+  // Per-provider truth needs the endpoints API; without a key it is
+  // unreachable, so skip rather than fall back to the catalog aggregate
+  // (which would clobber correct per-provider prices with a different
+  // provider's).
+  const apiKey = await resolveApiKey();
+  if (!apiKey) return { refreshed: 0, failed: [], diff: [] };
+
+  const patches: PricingLimitsPatch[] = [];
+  const failed: string[] = [];
+  for (const target of targets) {
+    const result = await client.fetchModelEndpoints(target.model.id, apiKey);
+    // A message means the endpoints list is unavailable (404 → model gone, or
+    // transport error): report the model as failed. An empty list without a
+    // message is treated the same — there is no endpoint to price from.
+    if (result.message || result.endpoints.length === 0) {
+      failed.push(target.model.id);
+      continue;
+    }
+    const patch = computeEndpointPatch(target, result.endpoints);
+    if (patch) patches.push(patch);
+  }
+  if (patches.length === 0) return { refreshed: 0, failed, diff: [] };
 
   // Apply to a fresh read so concurrent writes are not lost.
   const current = (await readJsonFile<ModelsJson>(modelsPath)) ?? { providers: {} };
-  const applied = applyPricingPatches(current, patches);
+  const { applied, diff } = applyPricingPatches(current, patches);
   if (applied > 0) await atomicWriteJson(modelsPath, current);
-  return { refreshed: applied, failed };
+  return { refreshed: applied, failed, diff };
+}
+
+// ---------------------------------------------------------------------------
+// Reload-time diff rendering
+// ---------------------------------------------------------------------------
+
+const COST_FIELD_LABELS: Array<{ key: keyof ModelConfig["cost"]; label: string }> = [
+  { key: "input", label: "cost.input" },
+  { key: "output", label: "cost.output" },
+  { key: "cacheRead", label: "cost.cacheRead" },
+  { key: "cacheWrite", label: "cost.cacheWrite" },
+];
+
+/** Cost is stored as dollars-per-million-tokens (see toCost); render as $/M. */
+function formatCost(v: number): string {
+  return `$${v.toFixed(2)}/M`;
+}
+
+function formatTokens(v: number): string {
+  return v.toLocaleString("en-US");
+}
+
+/**
+ * Render the refresh diff as aligned, model-grouped lines (no header). Only
+ * fields that actually changed are emitted, so an unchanged model contributes
+ * nothing and an unchanged field within a changed model is hidden. Returns an
+ * empty string when there is nothing to show.
+ */
+export function formatRefreshDiff(diff: PricingLimitsDiff[]): string {
+  if (diff.length === 0) return "";
+  const lines: string[] = [];
+  for (const d of diff) {
+    const rows: Array<[string, string, string]> = []; // [label, before, after]
+    for (const { key, label } of COST_FIELD_LABELS) {
+      if (d.before.cost[key] !== d.after.cost[key]) {
+        rows.push([label, formatCost(d.before.cost[key]), formatCost(d.after.cost[key])]);
+      }
+    }
+    if (d.before.contextWindow !== d.after.contextWindow) {
+      rows.push(["contextWindow", formatTokens(d.before.contextWindow), formatTokens(d.after.contextWindow)]);
+    }
+    if (d.before.maxTokens !== d.after.maxTokens) {
+      rows.push(["maxTokens", formatTokens(d.before.maxTokens), formatTokens(d.after.maxTokens)]);
+    }
+    if (rows.length === 0) continue;
+    lines.push(`  ${d.modelId} (${d.provider}):`);
+    const width = Math.max(...rows.map((r) => r[0].length));
+    for (const [label, before, after] of rows) {
+      lines.push(`    ${label.padEnd(width)}  ${before}  →  ${after}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
