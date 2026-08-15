@@ -90,3 +90,38 @@ jobs:
           tag_name: ${{ steps.tag.outputs.version }}
           prerelease: ${{ steps.tag.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
+
+  # End-to-end suite against the PUBLISHED package: installs the exact version
+  # that just shipped from npm, loads it through pi's real extension loader
+  # (package.json pi.extensions → jiti), and drives real OpenRouter endpoints.
+  # Gated by CI_E2E=1 (see test/e2e.test.ts); requires the npm-publish
+  # environment secret OPENROUTER_API_KEY.
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [publish, release]
+    environment: npm-publish
+    permissions:
+      contents: read
+    env:
+      CI_E2E: "1"
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org/
+      - run: npm ci
+      - name: Install pi and the just-published pin into an isolated prefix
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          DEPS_DIR="$RUNNER_TEMP/orpin-e2e-deps"
+          mkdir -p "$DEPS_DIR"
+          cd "$DEPS_DIR"
+          # A separate prefix: the repo IS @xamfoo/pi-openrouter-pin, so npm
+          # refuses to install the same name into its own node_modules.
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "@earendil-works/pi-coding-agent@latest" "@xamfoo/pi-openrouter-pin@${PKG_VERSION}"
+          echo "ORPIN_PKG_DIR=$DEPS_DIR/node_modules/@xamfoo/pi-openrouter-pin" >> "$GITHUB_ENV"
+      - name: Run the end-to-end suite (published package through pi's loader)
+        run: npm test
