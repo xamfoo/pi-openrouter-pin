@@ -30,7 +30,7 @@ import { createEventBus, discoverAndLoadExtensions, initTheme } from "@earendil-
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, TUI_KEYBINDINGS, type Component, type KeybindingsManager as TuiKeybindingsManager, type TUI } from "@earendil-works/pi-tui";
 import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient } from "../src/api.ts";
-import { findEndpoint, slugify, toPricingAndLimits, type RawEndpointShape, type RawModelShape } from "../src/config.ts";
+import { findEndpoint, endpointSlug, slugify, toPricingAndLimits, type RawEndpointShape, type RawModelShape } from "../src/config.ts";
 import { readJsonFile, type ModelsJson, type SettingsJson } from "../src/files.ts";
 
 // ---------------------------------------------------------------------------
@@ -108,10 +108,10 @@ async function discoverTarget(): Promise<LiveTarget> {
       if (attempts++ >= 30) break;
       const { endpoints, message } = await client.fetchModelEndpoints(raw.id, process.env.OPENROUTER_API_KEY);
       if (message || endpoints.length === 0) continue;
-      const slugs = [...new Set(endpoints.map((e) => slugify(e.provider_name ?? "")).filter(Boolean))];
+      const slugs = [...new Set(endpoints.map((e) => endpointSlug(e)).filter(Boolean))];
       if (slugs.length === 0) continue;
       const slug = slugs[0];
-      const quantEndpoint = endpoints.find((e) => slugify(e.provider_name ?? "") === slug && e.quantization);
+      const quantEndpoint = endpoints.find((e) => endpointSlug(e) === slug && e.quantization);
       const target: LiveTarget = {
         modelId: raw.id,
         slug,
@@ -292,7 +292,7 @@ test("e2e: live discovery picks a model with a serving endpoint from the catalog
   assert.ok(target.slug, "an anchor provider slug must be chosen");
   assert.ok(target.endpoints.length > 0, "the model must have serving endpoints");
   assert.ok(
-    target.endpoints.some((e) => slugify(e.provider_name ?? "") === target.slug),
+    target.endpoints.some((e) => endpointSlug(e) === target.slug),
     `the anchor provider ${target.slug} must serve ${target.modelId}`,
   );
   assert.notEqual(target.otherSlug, target.slug, "the relaxed-routing second slug must differ from the anchor");

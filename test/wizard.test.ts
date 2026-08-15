@@ -57,7 +57,7 @@ const deepseekRaw = (): RawModelShape => ({
 interface HarnessOptions {
   catalog?: RawModelShape[];
   catalogError?: string;
-  endpoints?: Array<{ provider_name?: string; quantization?: string }>;
+  endpoints?: Array<{ provider_name?: string; tag?: string; quantization?: string }>;
   endpointsMessage?: string;
   endpointsError?: string;
   userModels?: Set<string> | null;
@@ -600,6 +600,42 @@ test("provider step: loading state, deduped sorted list, breadcrumb", async () =
       await settle();
       assert.equal(h.doneValues[0]?.slug, "novita", "sorted list commits the first provider");
       await started;
+  });
+});
+
+test("provider step: tag-based slugs dedupe to base routing slugs after the Google rename", async () => {
+  await withTempDir(
+    {
+      catalog: [glmRaw()],
+      // provider_name was renamed ("Google Vertex AI" → "Google"); the base
+      // routing slug now lives in the tag's first segment. Variants of the
+      // same provider (google-vertex/global, google-vertex/us-east5) dedupe.
+      endpoints: [
+        { provider_name: "Google", tag: "google-vertex/global" },
+        { provider_name: "Google AI Studio", tag: "google-ai-studio" },
+        { provider_name: "Google", tag: "google-vertex/us-east5" }, // duplicate base slug → deduped
+      ],
+      apiKey: "test-key",
+    },
+    async (modelsPath, settingsPath, h) => {
+      const started = h.start(modelsPath, settingsPath);
+      await settle();
+      await pickModel(h);
+
+      assert.ok(h.text().includes("Pick a provider (2 serve z-ai/glm-5.2)"), "tag variants dedupe to 2 base slugs");
+      h.press("enter"); // first (sorted) provider → google-ai-studio
+      await settle();
+      await pickFirst(h); // quant
+      await pickFirst(h); // name
+      h.press("strict");
+      h.press("enter");
+      await settle();
+      h.press("enter"); // default → yes
+      await settle();
+      assert.equal(h.doneValues[0]?.slug, "google-ai-studio", "tag-based slug list commits the sorted first provider");
+      await started;
+      const models = await readJsonFile<ModelsJson>(modelsPath);
+      assert.ok(models!.providers!["openrouter-google-ai-studio"], "pin lands on the tag-derived provider name");
   });
 });
 

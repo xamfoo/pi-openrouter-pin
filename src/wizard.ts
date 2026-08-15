@@ -42,7 +42,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { OpenRouterClient } from "./api.ts";
 import { providerLabel, resolveOpenRouterApiKey } from "./api.ts";
-import { COMMON_QUANTIZATIONS, providerNameFor, slugify, type RawModelShape } from "./config.ts";
+import { COMMON_QUANTIZATIONS, endpointSlug, providerNameFor, slugify, type RawModelShape } from "./config.ts";
 import { performPin, rankModelsForQuery } from "./commands.ts";
 
 type TabId = "model" | "provider" | "quant" | "name" | "routing" | "order" | "ignore" | "dc" | "default";
@@ -520,7 +520,7 @@ class WizardComponent {
       .then((apiKey) => (this.disposed ? undefined : this.client.fetchModelEndpoints(m.id, apiKey)))
       .then((result) => {
         if (this.disposed || !result) return;
-        this.providerSlugs = [...new Set(result.endpoints.map((e) => slugify(e.provider_name ?? "")))].filter(Boolean).sort();
+        this.providerSlugs = [...new Set(result.endpoints.map((e) => endpointSlug(e)))].filter(Boolean).sort();
         this.endpointsMsg = result.message ?? null;
         this.endpointsLoaded = true;
         this.providerFuzzy.clearQuery(); // fresh list for a (possibly new) model

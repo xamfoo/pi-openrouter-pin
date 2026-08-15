@@ -54,3 +54,54 @@ test("searchModels: builds the ?q= URL and memoizes the last query", async () =>
     globalThis.fetch = realFetch;
   }
 });
+
+test("validateEndpoint: matches the tag's base routing slug after the Google rename", async () => {
+  const calls: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    calls.push(String(input));
+    // OpenRouter now reports provider_name "Google" (renamed from "Google
+    // Vertex AI") and carries the routing slug in each endpoint's tag.
+    return new Response(JSON.stringify({
+      data: {
+        endpoints: [
+          { provider_name: "Google", tag: "google-vertex/global" },
+          { provider_name: "Google", tag: "google-vertex/global/flex" },
+          { provider_name: "Google AI Studio", tag: "google-ai-studio" },
+        ],
+      },
+    }));
+  }) as typeof fetch;
+  try {
+    const client = new OpenRouterClient(60_000, 60_000);
+    const ok = await client.validateEndpoint("google/gemini-3.7-flash", "google-vertex", undefined, "test-key");
+    assert.equal(ok.status, "ok", "google-vertex must validate from its tag");
+    assert.equal(ok.endpoint?.tag, "google-vertex/global");
+    assert.ok(calls[0]?.includes("google/gemini-3.7-flash/endpoints"), "endpoints URL uses the model path");
+
+    // A slug OpenRouter does not serve is refused, and the message lists the
+    // tag-derived slugs a user could actually pin.
+    const err = await client.validateEndpoint("google/gemini-3.7-flash", "novita", undefined, "test-key");
+    assert.equal(err.status, "error");
+    assert.ok(err.message.includes("does not serve"), "error explains the refusal");
+    assert.ok(err.message.includes("google-ai-studio"), "available list includes google-ai-studio");
+    assert.ok(err.message.includes("google-vertex"), "available list includes google-vertex");
+    assert.ok(!err.message.includes("google,"), "renamed provider_name must not leak as slug \"google\"");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("validateEndpoint: without a key, pinning is unvalidated (not refused)", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error("fetch must not be called without an API key");
+  }) as typeof fetch;
+  try {
+    const client = new OpenRouterClient(60_000, 60_000);
+    const result = await client.validateEndpoint("google/gemini-3.7-flash", "google-vertex", undefined, undefined);
+    assert.equal(result.status, "unvalidated");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
