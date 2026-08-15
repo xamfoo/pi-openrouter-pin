@@ -1,6 +1,6 @@
 {
   "name": "@xamfoo/pi-openrouter-pin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pi extension to pin an OpenRouter model to a provider.",
   "type": "module",
   "keywords": [
