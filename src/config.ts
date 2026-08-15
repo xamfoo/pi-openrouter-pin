@@ -30,6 +30,13 @@ export interface RawModelShape {
  */
 export interface RawEndpointShape {
   name?: string;
+  /**
+   * OpenRouter's routing slug for this endpoint (e.g. "google-vertex/global",
+   * "novita/fp8"). Since OpenRouter renamed display names ("Google Vertex AI"
+   * → "Google"), provider_name is no longer a reliable slug source; the tag's
+   * first path segment is the provider's base routing slug.
+   */
+  tag?: string;
   provider_name?: string;
   quantization?: string;
   pricing?: Record<string, string>;
@@ -109,6 +116,23 @@ export const COMMON_QUANTIZATIONS = ["none", "fp8", "bf16", "fp16", "int4"];
 /** Normalize an OpenRouter provider slug: "NVIDIA" → "nvidia", "Z AI" → "z-ai". */
 export function slugify(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/**
+ * The provider's base routing slug for an endpoint: the first path segment of
+ * the endpoint's `tag` when present ("google-vertex/global" → "google-vertex"),
+ * else the slugified provider_name ("Novita" → "novita"). The tag is
+ * OpenRouter's routing slug — a base slug matches all of a provider's
+ * variants/regions — while provider_name is a display name that OpenRouter may
+ * rename ("Google Vertex AI" → "Google"), so the tag wins when available.
+ */
+export function endpointSlug(e: RawEndpointShape): string {
+  const tag = e.tag?.trim();
+  if (tag) {
+    const base = slugify(tag.split("/")[0]);
+    if (base) return base;
+  }
+  return slugify(e.provider_name ?? "");
 }
 
 /** True when the pin's routing policy is not a strict single-provider pin. */
@@ -240,7 +264,7 @@ export function findEndpoint(
   slug: string,
   quant?: string,
 ): RawEndpointShape | undefined {
-  const bySlug = endpoints.filter((e) => slugify(e.provider_name ?? "") === slug);
+  const bySlug = endpoints.filter((e) => endpointSlug(e) === slug);
   if (bySlug.length === 0) return undefined;
   if (!quant) return bySlug[0];
   return bySlug.find((e) => (e.quantization ?? "").toLowerCase() === quant.toLowerCase());

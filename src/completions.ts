@@ -4,7 +4,7 @@
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 import type { OpenRouterClient } from "./api.ts";
 import { pinnedProviderSlugs, providerLabel } from "./api.ts";
-import { COMMON_QUANTIZATIONS, slugify } from "./config.ts";
+import { COMMON_QUANTIZATIONS, endpointSlug } from "./config.ts";
 import { rankModelsForQuery } from "./commands.ts";
 
 const FLAGS = ["--default", "--quant", "--name", "--order", "--ignore", "--fallback", "--data-collection"];
@@ -52,7 +52,7 @@ export function makePinCompletions(
         try {
           const apiKey = process.env.OPENROUTER_API_KEY;
           const { endpoints } = await client.fetchModelEndpoints(modelId, apiKey);
-          const slugs = [...new Set(endpoints.map((e) => slugify(e.provider_name ?? "")))].filter(Boolean).sort();
+          const slugs = [...new Set(endpoints.map((e) => endpointSlug(e)))].filter(Boolean).sort();
           if (slugs.length > 0) return slugs;
         } catch (err) {
           console.error(`[openrouter-pin] slug completion failed for ${modelId}:`, err);

@@ -6,7 +6,7 @@
  * process, and tests each get independent state.
  */
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { slugify, type RawEndpointShape, type RawModelShape } from "./config.ts";
+import { endpointSlug, type RawEndpointShape, type RawModelShape } from "./config.ts";
 import { readJsonFile, type ModelsJson } from "./files.ts";
 
 export const OR_BASE_URL = "https://openrouter.ai/api/v1";
@@ -198,8 +198,8 @@ export class OpenRouterClient {
         note: `${message} — routing applied unvalidated; a wrong provider will surface as an OpenRouter 400 on first request`,
       };
     }
-    const bySlug = endpoints.filter((e) => slugify(e.provider_name ?? "") === slug);
-    const availableSlugs = [...new Set(endpoints.map((e) => slugify(e.provider_name ?? "")))].filter(Boolean).sort();
+    const bySlug = endpoints.filter((e) => endpointSlug(e) === slug);
+    const availableSlugs = [...new Set(endpoints.map((e) => endpointSlug(e)))].filter(Boolean).sort();
     if (bySlug.length === 0) {
       return {
         status: "error",

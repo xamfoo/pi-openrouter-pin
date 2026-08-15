@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   buildPin,
+  endpointSlug,
   findEndpoint,
   mergeEndpointCost,
   pricingAndLimitsFromEndpoint,
@@ -274,6 +275,41 @@ test("findEndpoint: matches slug, then quant; never substitutes another quant's 
   // Unknown slug → undefined.
   assert.equal(findEndpoint(endpoints, "baseten"), undefined);
   assert.equal(findEndpoint([], "novita"), undefined);
+});
+
+test("findEndpoint: matches the tag's base slug, not the renamed provider_name", () => {
+  const endpoints: RawEndpointShape[] = [
+    // OpenRouter renamed "Google Vertex AI" → "Google"; the routing slug
+    // lives in the tag, so google-vertex must still match its endpoints.
+    { provider_name: "Google", tag: "google-vertex/global", quantization: "fp8" },
+    { provider_name: "Google", tag: "google-vertex/us-east5" },
+    { provider_name: "Google AI Studio", tag: "google-ai-studio" },
+  ];
+  assert.equal(findEndpoint(endpoints, "google-vertex")!.tag, "google-vertex/global");
+  assert.equal(findEndpoint(endpoints, "google-vertex", "fp8")!.tag, "google-vertex/global");
+  // Tag variants share the base slug; the first one wins without a quant.
+  assert.equal(findEndpoint(endpoints, "google-vertex", "bf16"), undefined);
+  // provider_name "Google" must NOT alias to slug "google" when a tag exists.
+  assert.equal(findEndpoint(endpoints, "google"), undefined);
+  assert.equal(findEndpoint(endpoints, "google-ai-studio")!.tag, "google-ai-studio");
+});
+
+test("endpointSlug: tag's first segment wins; provider_name is the fallback", () => {
+  // The regression: provider_name was renamed but the tag keeps the slug.
+  assert.equal(endpointSlug({ provider_name: "Google", tag: "google-vertex/global" }), "google-vertex");
+  assert.equal(endpointSlug({ provider_name: "Google", tag: "google-vertex/us-east5" }), "google-vertex");
+  assert.equal(endpointSlug({ provider_name: "Google AI Studio", tag: "google-ai-studio" }), "google-ai-studio");
+  assert.equal(endpointSlug({ provider_name: "Novita", tag: "novita/fp8" }), "novita");
+  // No tag → slugified provider_name (legacy endpoints keep working).
+  assert.equal(endpointSlug({ provider_name: "Novita" }), "novita");
+  // Literal fallback behavior: no tag, so the display name is slugified
+  // verbatim ("Google Vertex AI" → "google-vertex-ai" — the tag is what
+  // yields the canonical "google-vertex").
+  assert.equal(endpointSlug({ provider_name: "Google Vertex AI" }), "google-vertex-ai");
+  assert.equal(endpointSlug({}), "");
+  // A tag whose first segment slugifies empty falls back to provider_name.
+  assert.equal(endpointSlug({ provider_name: "Novita", tag: "/global" }), "novita");
+  assert.equal(endpointSlug({ provider_name: "Novita", tag: "  " }), "novita");
 });
 
 test("slugify: one normalizer for endpoint names and user input", () => {
