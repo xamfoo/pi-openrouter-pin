@@ -561,6 +561,81 @@ test("/openrouter-unpin (no args): no pins → hint without opening the picker",
   });
 });
 
+test("/openrouter-pin --help: prints help without pinning or opening the wizard", async () => {
+  await withAgentDir(async () => {
+    const h = new CommandHarness();
+    await h.run("openrouter-pin", "--help");
+    assert.equal(h.notifications.length, 1);
+    assert.equal(h.notifications[0].type, "info");
+    assert.match(h.notifications[0].message, /^Usage: \/openrouter-pin/);
+    assert.ok(h.notifications[0].message.includes("--quant"));
+    const modelsPath = join(process.env.PI_CODING_AGENT_DIR!, "models.json");
+    assert.equal(await readJsonFile(modelsPath), null, "--help never writes models.json");
+  });
+});
+
+test("/openrouter-pin -h: short flag prints the same help", async () => {
+  await withAgentDir(async () => {
+    const h = new CommandHarness();
+    await h.run("openrouter-pin", "-h");
+    assert.equal(h.notifications.length, 1);
+    assert.equal(h.notifications[0].type, "info");
+    assert.match(h.notifications[0].message, /^Usage: \/openrouter-pin/);
+    // A pin-looking invocation with --help anywhere also shows help, and
+    // never reaches the network or models.json.
+    const mixed = new CommandHarness();
+    await mixed.run("openrouter-pin", "z-ai/glm-5.2 novita --help");
+    assert.equal(mixed.notifications.length, 1);
+    assert.match(mixed.notifications[0].message, /^Usage: \/openrouter-pin/);
+  });
+});
+
+test("/openrouter-unpin --help: prints help and touches nothing", async () => {
+  await withAgentDir(async () => {
+    const h = new CommandHarness();
+    await h.run("openrouter-unpin", "--help");
+    assert.equal(h.notifications.length, 1);
+    assert.equal(h.notifications[0].type, "info");
+    assert.match(h.notifications[0].message, /^Usage: \/openrouter-unpin/);
+    const modelsPath = join(process.env.PI_CODING_AGENT_DIR!, "models.json");
+    assert.equal(await readJsonFile(modelsPath), null, "--help never creates models.json");
+  });
+});
+
+test("/openrouter-unpin -h: short flag prints the same help", async () => {
+  await withAgentDir(async () => {
+    const h = new CommandHarness();
+    await h.run("openrouter-unpin", "-h");
+    assert.equal(h.notifications.length, 1);
+    assert.equal(h.notifications[0].type, "info");
+    assert.match(h.notifications[0].message, /^Usage: \/openrouter-unpin/);
+  });
+});
+
+test("/openrouter-pins --help: prints help even with pins present", async () => {
+  await withAgentDir(async () => {
+    const modelsPath = join(process.env.PI_CODING_AGENT_DIR!, "models.json");
+    await atomicWriteJson(modelsPath, {
+      providers: { "openrouter-novita": providerEntry([glmModel()]) },
+    });
+    const h = new CommandHarness();
+    await h.run("openrouter-pins", "--help");
+    assert.equal(h.notifications.length, 1);
+    assert.equal(h.notifications[0].type, "info");
+    assert.match(h.notifications[0].message, /^Usage: \/openrouter-pins/);
+  });
+});
+
+test("/openrouter-pins -h: short flag prints the same help", async () => {
+  await withAgentDir(async () => {
+    const h = new CommandHarness();
+    await h.run("openrouter-pins", "-h");
+    assert.equal(h.notifications.length, 1);
+    assert.equal(h.notifications[0].type, "info");
+    assert.match(h.notifications[0].message, /^Usage: \/openrouter-pins/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // D — Refresh pipeline
 // ---------------------------------------------------------------------------
