@@ -11,8 +11,7 @@ at every startup — no in-memory state.
 ## Install
 
 ```bash
-pi install npm:pi-openrouter-pin    # once published
-pi install /path/to/this/package    # local
+pi install npm:@xamfoo/pi-openrouter-pin
 ```
 
 ## Usage
