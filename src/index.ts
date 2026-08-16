@@ -23,7 +23,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient } from "./api.ts";
-import { parsePinArgs } from "./args.ts";
+import { isHelpRequest, parsePinArgs, PIN_HELP, PINS_HELP, UNPIN_HELP } from "./args.ts";
 import { makePinCompletions } from "./completions.ts";
 import { formatRouting, formatRefreshDiff, listPins, performPin, performUnpin, refreshPinnedModels } from "./commands.ts";
 import { providerNameFor } from "./config.ts";
@@ -81,6 +81,10 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
       "[--quant q] [--name 'Display'] [--default] [--order a,b,c] [--ignore a,b] [--fallback] [--data-collection allow|deny]",
     getArgumentCompletions: (prefix) => pinCompletions(prefix),
     handler: async (args, ctx: ExtensionCommandContext) => {
+      if (isHelpRequest(args)) {
+        ctx.ui.notify(PIN_HELP, "info");
+        return;
+      }
       if (!args.trim()) {
         await runWizard(modelsPath, settingsPath, pi, ctx.ui, client, ctx.modelRegistry);
         return;
@@ -112,6 +116,10 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
       "Remove an OpenRouter provider pin from models.json. No args picks from existing pins. " +
       "With args: /openrouter-unpin <model-id> (applies on /reload or next session)",
     handler: async (args, ctx: ExtensionCommandContext) => {
+      if (isHelpRequest(args)) {
+        ctx.ui.notify(UNPIN_HELP, "info");
+        return;
+      }
       try {
         let modelId = args.trim().split(/\s+/)[0];
         if (!modelId) {
@@ -146,7 +154,11 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("openrouter-pins", {
     description: "List all pinned OpenRouter provider routes from models.json",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
+    handler: async (args, ctx: ExtensionCommandContext) => {
+      if (isHelpRequest(args)) {
+        ctx.ui.notify(PINS_HELP, "info");
+        return;
+      }
       try {
         const pins = await listPins(modelsPath);
         ctx.ui.notify(

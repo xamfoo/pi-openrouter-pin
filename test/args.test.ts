@@ -3,7 +3,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parsePinArgs, tokenize } from "../src/args.ts";
+import { isHelpRequest, parsePinArgs, PIN_HELP, PINS_HELP, tokenize, UNPIN_HELP } from "../src/args.ts";
 
 test("tokenize: double quotes, escaped quotes, single quotes, backslashes", () => {
   assert.deepEqual(tokenize('z-ai/glm-5.2 novita --quant fp8 --name "GLM 5.2"'), [
@@ -66,6 +66,48 @@ test("parsePinArgs: --data-collection is orthogonal — it parses on any pin, va
   // The renamed flag is --fallback; the old spelling is gone.
   assert.ok("error" in parsePinArgs("a b --allow-fallbacks"));
   assert.ok(!("error" in parsePinArgs("a b --fallback")));
+});
+
+test("isHelpRequest: -h / --help in any position, exact token only", () => {
+  assert.equal(isHelpRequest(""), false);
+  assert.equal(isHelpRequest("z-ai/glm-5.2 novita"), false);
+  assert.equal(isHelpRequest("--help"), true);
+  assert.equal(isHelpRequest("-h"), true);
+  assert.equal(isHelpRequest("z-ai/glm-5.2 novita --help"), true);
+  assert.equal(isHelpRequest("--quant fp8 -h"), true);
+  // Token-based: a quoted "--help" is still its own token after tokenize.
+  assert.equal(isHelpRequest('--name "--help"'), true);
+  // A token that merely contains -h inside a word is not a help request.
+  assert.equal(isHelpRequest("--name sh-orthand"), false);
+});
+
+test("parsePinArgs: -h / --help short-circuit positional and slug checks", () => {
+  const long = parsePinArgs("--help");
+  assert.ok(!("error" in long));
+  assert.equal(long.help, true);
+  const short = parsePinArgs("-h");
+  assert.ok(!("error" in short));
+  assert.equal(short.help, true);
+  // Help wins even alongside valid or invalid pin arguments.
+  const mixed = parsePinArgs("z-ai/glm-5.2 novita --quant fp8 --help");
+  assert.ok(!("error" in mixed));
+  assert.equal(mixed.help, true);
+  const noPositionals = parsePinArgs("-h");
+  assert.ok(!("error" in noPositionals), "bare -h never trips the usage error");
+  assert.equal(noPositionals.help, true);
+});
+
+test("help text: PIN_HELP / UNPIN_HELP / PINS_HELP carry usage and --help", () => {
+  for (const text of [PIN_HELP, UNPIN_HELP, PINS_HELP]) {
+    assert.ok(text.includes("Usage:"), "each help text has a usage line");
+    assert.ok(text.includes("--help"), "each help text mentions --help");
+  }
+  // PIN_HELP documents the pin-specific flag surface; the others stay short.
+  assert.ok(PIN_HELP.includes("--quant"));
+  assert.ok(PIN_HELP.includes("--order"));
+  assert.ok(PIN_HELP.includes("--data-collection"));
+  assert.ok(UNPIN_HELP.includes("model-id"));
+  assert.ok(UNPIN_HELP.includes("model-id") && UNPIN_HELP.split("\n").length < 15, "unpin help stays concise");
 });
 
 test("parsePinArgs: value-taking flags error when the value is missing, never silently ignore it", () => {

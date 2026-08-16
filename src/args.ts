@@ -13,6 +13,8 @@ export interface PinArgs {
   allowFallbacks?: boolean;
   dataCollection?: "allow" | "deny";
   isDefault: boolean;
+  /** Set when the command line contains -h / --help; parsing short-circuits. */
+  help?: boolean;
 }
 
 /**
@@ -77,6 +79,64 @@ export const PIN_USAGE =
   "Usage: /openrouter-pin <model-id> <provider> [--quant q] [--name 'Display'] [--default] " +
   "[--order a,b,c] [--ignore a,b] [--fallback] [--data-collection allow|deny]";
 
+// ---------------------------------------------------------------------------
+// Help text for the three commands (shown by `-h` / `--help`)
+// ---------------------------------------------------------------------------
+
+/** Help for /openrouter-pin: usage, flags, and examples. */
+export const PIN_HELP = [
+  "Usage: /openrouter-pin <model-id> <provider> [flags]",
+  "",
+  "Pin an OpenRouter model to a specific provider as a persistent pi provider",
+  "(writes models.json; applies on /reload or next session). With no arguments",
+  "the interactive wizard opens instead.",
+  "",
+  "Flags:",
+  "  --quant q            quantization to lock (e.g. fp8)",
+  "  --name 'Display'     display name for the pinned model",
+  "  --default            also make the pin the default pi model",
+  "  --order a,b,c        preferred provider order (relaxed pin)",
+  "  --ignore a,b         providers to exclude (relaxed pin)",
+  "  --fallback           allow fallbacks to other providers (relaxed pin)",
+  "  --data-collection    allow|deny — data retention policy",
+  "  -h, --help           show this help",
+  "",
+  "Examples:",
+  "  /openrouter-pin z-ai/glm-5.2 novita --quant fp8",
+  "  /openrouter-pin openai/gpt-oss-120b groq --order baseten,together",
+].join("\n");
+
+/** Help for /openrouter-unpin: usage and behavior. */
+export const UNPIN_HELP = [
+  "Usage: /openrouter-unpin [model-id]",
+  "",
+  "Remove a pinned OpenRouter model from models.json (applies on /reload or",
+  "next session). Without an argument, picks from the existing pins.",
+  "",
+  "Flags:",
+  "  -h, --help           show this help",
+].join("\n");
+
+/** Help for /openrouter-pins: usage and behavior. */
+export const PINS_HELP = [
+  "Usage: /openrouter-pins",
+  "",
+  "List every pinned OpenRouter model with its provider and routing policy",
+  "(only, order, ignore, quant, fallbacks, data collection).",
+  "",
+  "Flags:",
+  "  -h, --help           show this help",
+].join("\n");
+
+/**
+ * True when the command line contains a -h / --help token in any position.
+ * Token-based, so a flag value that merely contains "--help" (quoted or
+ * escaped) does not count unless it is its own token.
+ */
+export function isHelpRequest(args: string): boolean {
+  return tokenize(args).some((t) => t === "-h" || t === "--help");
+}
+
 export function parsePinArgs(args: string): { error: string } | PinArgs {
   const tokens = tokenize(args);
   const pin: PinArgs = { isDefault: false };
@@ -111,9 +171,12 @@ export function parsePinArgs(args: string): { error: string } | PinArgs {
       if ("error" in parsed) return parsed;
       if (t === "--order") pin.order = parsed;
       else pin.ignore = parsed;
-    } else if (t.startsWith("--")) return { error: `Unknown flag: ${t}` };
+    } else if (t === "-h" || t === "--help") pin.help = true;
+    else if (t.startsWith("--")) return { error: `Unknown flag: ${t}` };
     else positional.push(t);
   }
+  // Help short-circuits: no positional-count or slug validation is needed.
+  if (pin.help) return pin;
   if (positional.length < 2) return { error: PIN_USAGE };
   if (positional.length > 2) return { error: `Too many arguments: ${positional.slice(2).join(" ")}` };
   pin.modelId = positional[0];
