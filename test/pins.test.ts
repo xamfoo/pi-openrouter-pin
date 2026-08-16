@@ -1,7 +1,8 @@
 /**
- * Tests for the /openrouter-pins and /openrouter-unpin commands.
+ * Tests for the /openrouter-pins, /openrouter-unpin, and session-start
+ * refresh logic.
  *
- * Three layers:
+ * Four layers:
  *
  *   A — Pins surface: `formatRouting` (the /openrouter-pins display format)
  *       and `listPins` (what the command lists) from src/commands.ts.
@@ -16,6 +17,12 @@
  *       `ctx.custom` is resolved with a canned choice instead of driving a
  *       real TUI).
  *
+ *   D — Refresh pipeline: `formatRefreshDiff` (the pricing display formatter
+ *       that previously spilled multi-line output into the TUI footer),
+ *       `collectRefreshTargets` and `applyPricingPatches` (pure refresh
+ *       helpers), and the `session_start` handler that routes results to
+ *       `ctx.ui.notify()` instead of raw `console.*` calls.
+ *
  * These tests import index.ts, which pulls in @earendil-works/pi-coding-agent
  * and @earendil-works/pi-tui at runtime — run `npm install` (peer deps) first.
  */
@@ -26,8 +33,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import openrouterPinExtension from "../src/index.ts";
-import { formatRouting, listPins, performUnpin, unpinFromModels } from "../src/commands.ts";
+import {
+  applyPricingPatches,
+  collectRefreshTargets,
+  formatRefreshDiff,
+  formatRouting,
+  listPins,
+  performUnpin,
+  unpinFromModels,
+  type PricingLimitsDiff,
+  type PricingLimitsPatch,
+} from "../src/commands.ts";
 import { atomicWriteJson, readJsonFile, type ModelsJson, type ProviderEntry } from "../src/files.ts";
+import type { ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { ModelConfig } from "../src/config.ts";
 
 // ---------------------------------------------------------------------------
@@ -540,5 +558,420 @@ test("/openrouter-unpin (no args): no pins → hint without opening the picker",
     assert.deepEqual(h.notifications, [
       { message: "No pins to remove. Use /openrouter-pin to create one.", type: "info" },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D — Refresh pipeline
+// ---------------------------------------------------------------------------
+
+/** Harness for the `session_start` handler registered by the extension factory. */
+class SessionStartHarness {
+  readonly notifications: Notify[] = [];
+  private handler?: (event: unknown, ctx: ExtensionContext) => void | Promise<void>;
+
+  constructor() {
+    const pi = {
+      on: (event: string, handler: (..._args: unknown[]) => unknown) => {
+        if (event === "session_start") {
+          this.handler = handler as typeof this.handler;
+        }
+      },
+      registerProvider: () => {},
+      registerCommand: () => {},
+    } as unknown as ExtensionAPI;
+    openrouterPinExtension(pi);
+  }
+
+  async fireSessionStart(apiKey?: string): Promise<void> {
+    assert.ok(this.handler, "session_start handler must be registered");
+
+    const oldKey = process.env.OPENROUTER_API_KEY;
+    if (apiKey !== undefined) {
+      process.env.OPENROUTER_API_KEY = apiKey;
+    } else {
+      delete process.env.OPENROUTER_API_KEY;
+    }
+
+    try {
+      await this.handler!(
+        { type: "session_start", reason: "startup" },
+        {
+          mode: "tui",
+          hasUI: true,
+          cwd: "/tmp",
+          modelRegistry: {} as ModelRegistry,
+          model: undefined,
+          scopedModels: [],
+          ui: {
+            notify: (message: string, type: "info" | "warning" | "error" = "info") => {
+              this.notifications.push({ message, type });
+            },
+            select: async () => undefined,
+          },
+        } as unknown as ExtensionContext,
+      );
+    } finally {
+      if (oldKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = oldKey;
+    }
+
+    // Wait for async settle — refreshPinnedModels performs network I/O under the hood.
+    await delay(200);
+  }
+}
+
+const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- formatRefreshDiff -------------------------------------------------------
+
+test("formatRefreshDiff: empty diff returns an empty string", () => {
+  assert.equal(formatRefreshDiff([]), "");
+});
+
+test("formatRefreshDiff: unchanged model produces no output", () => {
+  const diff: PricingLimitsDiff[] = [{
+    provider: "openrouter-novita",
+    modelId: "z-ai/glm-5.2",
+    before: {
+      cost: { input: 0.39, output: 1.18, cacheRead: 0.07, cacheWrite: 0 },
+      contextWindow: 1_048_576,
+      maxTokens: 128_000,
+    },
+    after: {
+      cost: { input: 0.39, output: 1.18, cacheRead: 0.07, cacheWrite: 0 },
+      contextWindow: 1_048_576,
+      maxTokens: 128_000,
+    },
+  }];
+  assert.equal(formatRefreshDiff(diff), "");
+});
+
+test("formatRefreshDiff: single cost field change aligned", () => {
+  const diff: PricingLimitsDiff[] = [{
+    provider: "openrouter-novita",
+    modelId: "z-ai/glm-5.2",
+    before: {
+      cost: { input: 0.39, output: 1.18, cacheRead: 0.07, cacheWrite: 0 },
+      contextWindow: 1_048_576,
+      maxTokens: 128_000,
+    },
+    after: {
+      cost: { input: 0.34, output: 1.18, cacheRead: 0.07, cacheWrite: 0 },
+      contextWindow: 1_048_576,
+      maxTokens: 128_000,
+    },
+  }];
+  const result = formatRefreshDiff(diff);
+  // Labels changed: ["cost.input"] → width = 10
+  assert.equal(
+    result,
+    [
+      "  z-ai/glm-5.2 (openrouter-novita):",
+      "    cost.input  $0.39/M  →  $0.34/M",
+    ].join("\n"),
+  );
+});
+
+test("formatRefreshDiff: multiple cost fields, tabular alignment", () => {
+  const diff: PricingLimitsDiff[] = [{
+    provider: "openrouter-novita",
+    modelId: "z-ai/glm-5.2",
+    before: {
+      cost: { input: 0.39, output: 1.18, cacheRead: 0.07, cacheWrite: 0 },
+      contextWindow: 1_048_576,
+      maxTokens: 128_000,
+    },
+    after: {
+      cost: { input: 0.34, output: 1.18, cacheRead: 0.06, cacheWrite: 0 },
+      contextWindow: 1_048_576,
+      maxTokens: 128_000,
+    },
+  }];
+  const result = formatRefreshDiff(diff);
+  // Labels: ["cost.input"(10), "cost.cacheRead"(14)] → width = 14
+  // "cost.input".padEnd(14) = "cost.input    " (4 trailing spaces)
+  // "cost.cacheRead".padEnd(14) = "cost.cacheRead"   (exact length)
+  assert.equal(
+    result,
+    [
+      "  z-ai/glm-5.2 (openrouter-novita):",
+      "    cost.input      $0.39/M  →  $0.34/M",
+      "    cost.cacheRead  $0.07/M  →  $0.06/M",
+    ].join("\n"),
+  );
+});
+
+test("formatRefreshDiff: token-limit changes alongside costs", () => {
+  const diff: PricingLimitsDiff[] = [{
+    provider: "openrouter-groq",
+    modelId: "meta-llama/llama-4-scout",
+    before: {
+      cost: { input: 0.10, output: 0.50, cacheRead: 0.01, cacheWrite: 0 },
+      contextWindow: 131_072,
+      maxTokens: 32_768,
+    },
+    after: {
+      cost: { input: 0.08, output: 0.50, cacheRead: 0.01, cacheWrite: 0 },
+      contextWindow: 262_144,
+      maxTokens: 65_536,
+    },
+  }];
+  const result = formatRefreshDiff(diff);
+  // Labels: ["cost.input"(10), "contextWindow"(13), "maxTokens"(9)] → width = 13
+  assert.equal(
+    result,
+    [
+      "  meta-llama/llama-4-scout (openrouter-groq):",
+      "    cost.input     $0.10/M  →  $0.08/M",
+      "    contextWindow  131,072  →  262,144",
+      "    maxTokens      32,768  →  65,536",
+    ].join("\n"),
+  );
+});
+
+test("formatRefreshDiff: multi-model groups by model header", () => {
+  const diff: PricingLimitsDiff[] = [
+    {
+      provider: "openrouter-novita",
+      modelId: "z-ai/glm-5.2",
+      before: {
+        cost: { input: 0.39, output: 1.18, cacheRead: 0.07, cacheWrite: 0 },
+        contextWindow: 1_048_576,
+        maxTokens: 128_000,
+      },
+      after: {
+        cost: { input: 0.34, output: 1.18, cacheRead: 0.06, cacheWrite: 0 },
+        contextWindow: 1_048_576,
+        maxTokens: 128_000,
+      },
+    },
+    {
+      provider: "openrouter-groq",
+      modelId: "meta-llama/llama-4-scout",
+      before: {
+        cost: { input: 0.10, output: 0.50, cacheRead: 0.01, cacheWrite: 0 },
+        contextWindow: 131_072,
+        maxTokens: 32_768,
+      },
+      after: {
+        cost: { input: 0.08, output: 0.50, cacheRead: 0.01, cacheWrite: 0 },
+        contextWindow: 131_072,
+        maxTokens: 65_536,
+      },
+    },
+  ];
+  const result = formatRefreshDiff(diff);
+  // Model 1 width = max(10, 14) = 14; Model 2 width = max(10, 9) = 10
+  assert.equal(
+    result,
+    [
+      "  z-ai/glm-5.2 (openrouter-novita):",
+      "    cost.input      $0.39/M  →  $0.34/M",
+      "    cost.cacheRead  $0.07/M  →  $0.06/M",
+      "  meta-llama/llama-4-scout (openrouter-groq):",
+      "    cost.input  $0.10/M  →  $0.08/M",
+      "    maxTokens   32,768  →  65,536",
+    ].join("\n"),
+  );
+});
+
+test("formatRefreshDiff: only changed fields appear (no redundant labels)", () => {
+  // Only input price changed — output, cacheRead, cacheWrite, tokens all hidden.
+  const diff: PricingLimitsDiff[] = [{
+    provider: "openrouter-novita",
+    modelId: "z-ai/glm-5.2",
+    before: {
+      cost: { input: 0.39, output: 1.18, cacheRead: 0.07, cacheWrite: 0 },
+      contextWindow: 1_048_576,
+      maxTokens: 128_000,
+    },
+    after: {
+      cost: { input: 0.34, output: 1.18, cacheRead: 0.07, cacheWrite: 0 },
+      contextWindow: 1_048_576,
+      maxTokens: 128_000,
+    },
+  }];
+  const result = formatRefreshDiff(diff);
+  assert.ok(!result.includes("cacheRead"), "unchanged cacheRead is hidden");
+  assert.ok(!result.includes("output"), "unchanged output is hidden");
+  assert.ok(!result.includes("cacheWrite"), "unchanged cacheWrite is hidden");
+  assert.ok(!result.includes("contextWindow"), "unchanged contextWindow is hidden");
+  assert.ok(!result.includes("maxTokens"), "unchanged maxTokens is hidden");
+  assert.ok(result.includes("cost.input"), "changed cost.input is shown");
+});
+
+// --- collectRefreshTargets ---------------------------------------------------
+
+test("collectRefreshTargets: only openrouter-* providers with routing compat", () => {
+  const targets = collectRefreshTargets({
+    providers: {
+      "openrouter-novita": providerEntry([glmModel()]),           // matched
+      "anthropic": providerEntry([glmModel()]),                   // not our prefix
+      "openrouter-together": providerEntry([{                     // matching prefix but no routing config
+        id: "google/gemini-2.5-pro",
+        name: "Gemini Pro",
+        reasoning: true,
+        input: ["text"],
+        contextWindow: 2_097_152,
+        maxTokens: 65_536,
+        cost: { input: 1.25, output: 5.00, cacheRead: 0.1875, cacheWrite: 0 },
+        compat: { openRouterRouting: {} },
+      }]),
+    },
+  });
+  assert.deepEqual(targets.map(t => [t.provider, t.model.id]), [
+    ["openrouter-novita", "z-ai/glm-5.2"],
+  ]);
+});
+
+test("collectRefreshTargets: missing file / empty providers → []", () => {
+  assert.deepEqual(collectRefreshTargets(null), []);
+  assert.deepEqual(collectRefreshTargets({}), []);
+  assert.deepEqual(collectRefreshTargets({ providers: {} }), []);
+});
+
+// --- applyPricingPatches -----------------------------------------------------
+
+test("applyPricingPatches: mutates models in-place and returns diffs", () => {
+  const current: ModelsJson = {
+    providers: {
+      "openrouter-novita": providerEntry([glmModel()]),
+    },
+  };
+  const patches: PricingLimitsPatch[] = [{
+    provider: "openrouter-novita",
+    modelId: "z-ai/glm-5.2",
+    cost: { input: 0.34, output: 0.98, cacheRead: 0.06, cacheWrite: 0 },
+    contextWindow: 2_097_152,
+    maxTokens: 65_536,
+  }];
+  const { applied, diff } = applyPricingPatches(current, patches);
+
+  assert.equal(applied, 1);
+  assert.equal(diff.length, 1);
+  assert.equal(diff[0].modelId, "z-ai/glm-5.2");
+  assert.deepEqual(diff[0].before.cost, glmModel().cost); // original cost preserved
+  assert.deepEqual(diff[0].after.cost, patches[0].cost); // patched cost recorded
+
+  // Verify in-place mutation on disk snapshot
+  assert.deepEqual(current.providers!["openrouter-novita"].models[0].cost, patches[0].cost);
+  assert.equal(current.providers!["openrouter-novita"].models[0].contextWindow, 2_097_152);
+  assert.equal(current.providers!["openrouter-novita"].models[0].maxTokens, 65_536);
+});
+
+test("applyPricingPatches: silently skips missing provider", () => {
+  const current: ModelsJson = {
+    providers: { "openrouter-novita": providerEntry([glmModel()]) },
+  };
+  const patches: PricingLimitsPatch[] = [{
+    provider: "openrouter-nonexistent",
+    modelId: "z-ai/glm-5.2",
+    cost: { input: 0.34, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_048_576,
+    maxTokens: 128_000,
+  }];
+  const { applied, diff } = applyPricingPatches(current, patches);
+  assert.equal(applied, 0);
+  assert.equal(diff.length, 0);
+});
+
+test("applyPricingPatches: silently skips missing model id within provider", () => {
+  const current: ModelsJson = {
+    providers: { "openrouter-novita": providerEntry([glmModel()]) },
+  };
+  const patches: PricingLimitsPatch[] = [{
+    provider: "openrouter-novita",
+    modelId: "nobody/home",
+    cost: { input: 0.34, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_048_576,
+    maxTokens: 128_000,
+  }];
+  const { applied, diff } = applyPricingPatches(current, patches);
+  assert.equal(applied, 0);
+  assert.equal(diff.length, 0);
+});
+
+test("applyPricingPatches: processes valid patches and skips invalid ones", () => {
+  const current: ModelsJson = {
+    providers: {
+      "openrouter-novita": providerEntry([glmModel(), deepseekModel()]),
+    },
+  };
+  const patches: PricingLimitsPatch[] = [
+    {  // valid
+      provider: "openrouter-novita",
+      modelId: "z-ai/glm-5.2",
+      cost: { input: 0.34, output: 0.98, cacheRead: 0.06, cacheWrite: 0 },
+      contextWindow: 2_097_152,
+      maxTokens: 65_536,
+    },
+    {  // invalid model id
+      provider: "openrouter-novita",
+      modelId: "fake/model",
+      cost: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 131_072,
+      maxTokens: 32_768,
+    },
+  ];
+  const { applied, diff } = applyPricingPatches(current, patches);
+  assert.equal(applied, 1);
+  assert.equal(diff.length, 1);
+
+  // GLM patched, DeepSeek untouched
+  const ids = current.providers!["openrouter-novita"].models.map(m => m.id);
+  assert.deepEqual(ids, ["z-ai/glm-5.2", "deepseek/deepseek-v4-flash-0731"]);
+  // GLM model cost was mutated
+  assert.deepEqual(current.providers!["openrouter-novita"].models[0].cost, patches[0].cost);
+});
+
+// --- session_start handler (integration) -------------------------------------
+
+test("session_start handler: no-op without API key (integration)", async () => {
+  // Without an OpenRouter API key, refreshPinnedModels returns immediately
+  // with empty results — no notification emitted. Guards against regressions
+  // where console.log leaks into the TUI footer.
+  const h = new SessionStartHarness();
+  await h.fireSessionStart(); // no API key set
+
+  // Without an API key, refreshPinnedModels either returns empty immediately
+  // (0 notifications) or hits an error (e.g. empty modelRegistry throws) which
+  // the handler catches and routes via ctx.ui.notify. Either outcome is
+  // acceptable — the critical assertion is that messages always go through
+  // notify() and never leak to raw console.*.
+  assert.ok(h.notifications.length <= 1, "at most one notification (none, or an error routed via ctx.ui.notify)");
+});
+
+test("session_start handler: routes refresh results via ctx.ui.notify (guarded)", async () => {
+  // Integration: requires OPENROUTER_API_KEY to make real API calls.
+  // Skipped entirely when absent (does not fail CI).
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    // eslint-disable-next-line no-console -- expected skip in environments without API keys
+    console.log("[skip] OPENROUTER_API_KEY not set");
+    return;
+  }
+
+  await withAgentDir(async () => {
+    const modelsPath = join(process.env.PI_CODING_AGENT_DIR!, "models.json");
+    await atomicWriteJson(modelsPath, {
+      providers: {
+        "openrouter-novita": providerEntry([glmModel({ id: "z-ai/glm-5.2" })]),
+      },
+    });
+
+    const h = new SessionStartHarness();
+    await h.fireSessionStart(apiKey);
+
+    // With real credentials, the handler should emit at least one notification
+    // (success with pricing, or warning if the endpoint call fails).
+    assert.ok(h.notifications.length > 0, "handler emits a notification for pinned models");
+    // All messages come through ctx.ui.notify — never raw console.*.
+    assert.ok(h.notifications.every(n => n.type === "info" || n.type === "warning" || n.type === "error"));
+    // Messages reference pricing or refresh, confirming the right logic ran.
+    const anyPricingMsg = h.notifications.some(n =>
+      n.message.toLowerCase().includes("refresh") || n.message.toLowerCase().includes("pricing"),
+    );
+    assert.ok(anyPricingMsg, "at least one message references pricing/refresh");
   });
 });

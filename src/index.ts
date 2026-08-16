@@ -48,15 +48,27 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
     void refreshPinnedModels(modelsPath, client, () => resolveOpenRouterApiKey(ctx.modelRegistry))
       .then((r) => {
         if (r.refreshed > 0) {
-          console.log(`[openrouter-pin] refreshed ${r.refreshed} pinned model pricing & limits — /reload to apply`);
           const diff = formatRefreshDiff(r.diff);
-          if (diff) console.log(diff);
+          if (diff) {
+            ctx.ui.notify(
+              `Refreshed ${r.refreshed} pinned model pricing & limits\n${diff}\n/reload to apply`,
+              "info",
+            );
+          } else {
+            ctx.ui.notify(`Refreshed ${r.refreshed} pinned model pricing & limits — /reload to apply`, "info");
+          }
         } else if (r.failed.length > 0) {
-          console.warn(`[openrouter-pin] pricing & limits refresh unavailable for ${r.failed.length} model(s): ${r.failed.join(", ")}`);
+          ctx.ui.notify(
+            `Pricing & limits refresh unavailable for ${r.failed.length} model(s): ${r.failed.join(", ")}`,
+            "warning",
+          );
         }
       })
       .catch((err) => {
-        console.error("[openrouter-pin] pricing & limits refresh failed:", err);
+        ctx.ui.notify(
+          `Pricing & limits refresh failed: ${err instanceof Error ? err.message : String(err)}`,
+          "error",
+        );
       });
   });
 

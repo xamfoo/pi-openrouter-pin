@@ -219,7 +219,13 @@ export function collectRefreshTargets(
   for (const [name, provider] of Object.entries(snapshot?.providers ?? {})) {
     if (!name.startsWith(PROVIDER_PREFIX)) continue;
     for (const m of Array.isArray(provider.models) ? provider.models : []) {
-      if (m.compat?.openRouterRouting) targets.push({ provider: name, model: m });
+      const r = m.compat?.openRouterRouting;
+      // Only include models that have actual routing configuration (not just
+      // an empty openRouterRouting object). The presence of any routing field
+      // (only, order, ignore, quantizations) indicates a real pin.
+      if (r && (r.only?.length || r.order?.length || r.ignore?.length || r.quantizations?.length)) {
+        targets.push({ provider: name, model: m });
+      }
     }
   }
   return targets;
