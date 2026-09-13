@@ -109,6 +109,9 @@ export interface PinOptions {
 
 export const COMMON_QUANTIZATIONS = ["none", "fp8", "bf16", "fp16", "int4"];
 
+/** Prefix marking a pinned OpenRouter provider in models.json. */
+export const PROVIDER_PREFIX = "openrouter-";
+
 // ---------------------------------------------------------------------------
 // Slug helpers
 // ---------------------------------------------------------------------------
