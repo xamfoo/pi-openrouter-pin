@@ -30,7 +30,7 @@
   "scripts": {
     "prepublishOnly": "npm run typecheck && npm test",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test \"test/*.test.ts\""
+    "test": "node --test --test-concurrency=1 \"test/*.test.ts\""
   },
   "files": [
     "src",

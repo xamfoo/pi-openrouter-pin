@@ -5,7 +5,7 @@
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 import type { OpenRouterClient, RawModel } from "./api.ts";
-import { PROVIDER_PREFIX } from "./api.ts";
+import { PROVIDER_PREFIX } from "./config.ts";
 import {
   anchorSlug,
   buildPin,
@@ -96,7 +96,9 @@ export async function performPin(
     // Register the FULL model list: registerProvider with `models` replaces
     // all models for the provider, so registering just the new pin would
     // silently drop previously pinned models from the live registry.
-    pi.registerProvider(built.providerName, providerEntry);
+    // Inject the resolved key live (never persisted to models.json —
+    // the disk invariant keeps "$OPENROUTER_API_KEY" placeholder).
+    pi.registerProvider(built.providerName, apiKey ? { ...providerEntry, apiKey } : providerEntry);
 
     const defaultSuffix = built.settingsPatch ? " and set as default" : "";
     ctx.notify(`Pinned ${built.providerName}/${opts.modelId}${defaultSuffix}.`, "info");

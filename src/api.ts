@@ -6,12 +6,16 @@
  * process, and tests each get independent state.
  */
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { endpointSlug, type RawEndpointShape, type RawModelShape } from "./config.ts";
+import {
+  endpointSlug,
+  PROVIDER_PREFIX,
+  type RawEndpointShape,
+  type RawModelShape,
+} from "./config.ts";
 import { readJsonFile, type ModelsJson } from "./files.ts";
 
 export const OR_BASE_URL = "https://openrouter.ai/api/v1";
 export const OR_MODELS_URL = `${OR_BASE_URL}/models`;
-export const PROVIDER_PREFIX = "openrouter-";
 export const FETCH_TIMEOUT_MS = 15000;
 export const CATALOG_CACHE_TTL_MS = 60_000;
 export const ENDPOINT_CACHE_TTL_MS = 60_000;
@@ -141,7 +145,7 @@ export class OpenRouterClient {
       this.userModelsAt = now;
       return this.userModels;
     } catch (err) {
-      console.warn(`[openrouter-pin] /models/user unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      console.warn(`[pi-openrouter-pin] /models/user unavailable: ${err instanceof Error ? err.message : String(err)}`);
       return null;
     }
   }
@@ -262,8 +266,8 @@ export async function pinnedProviderSlugs(modelsPath: string): Promise<string[]>
 /**
  * Resolve the OpenRouter API key through pi's own auth machinery
  * (getApiKeyForProvider handles env vars, $ENV interpolation, !command,
- * auth.json credentials, and OAuth), so a key configured any way other than
- * a plain env var still validates. Falls back to the env var last.
+ * auth.json credentials, and OAuth), so a key configured any way other
+ * than a plain env var still validates. Falls back to the env var last.
  * `pinProviderName` is the fully computed provider name of the pin being
  * validated (or undefined before a pin exists).
  */

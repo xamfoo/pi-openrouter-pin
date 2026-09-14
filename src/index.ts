@@ -23,6 +23,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient } from "./api.ts";
+import { readAuthJsonSync, registerPinnedProviders, resolveFactoryKey } from "./files.ts";
 import { isHelpRequest, parsePinArgs, PIN_HELP, PINS_HELP, UNPIN_HELP } from "./args.ts";
 import { makePinCompletions } from "./completions.ts";
 import { formatRouting, formatRefreshDiff, listPins, performPin, performUnpin, refreshPinnedModels } from "./commands.ts";
@@ -36,6 +37,18 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
   const modelsPath = join(agentDir, "models.json");
   const settingsPath = join(agentDir, "settings.json");
   const client = new OpenRouterClient(CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS);
+
+  // Factory auth inheritance: re-register pinned OpenRouter providers with
+  // the effective key (env → auth.json → undefined) synchronously, before
+  // registerCommand/on(session_start). No network, no async, never throws.
+  // Missing files are silent; malformed JSON warns. Note: pi loads
+  // models.json itself at startup, so we re-register here to inject the
+  // effective key that pi's own load wouldn't resolve for openrouter-* pins.
+  registerPinnedProviders(
+    pi,
+    modelsPath,
+    resolveFactoryKey(process.env.OPENROUTER_API_KEY, readAuthJsonSync(agentDir)),
+  );
 
   // Refresh pinned model pricing & limits (cost, contextWindow, maxTokens) at
   // session start. Deliberately NOT in the factory: factories run in
