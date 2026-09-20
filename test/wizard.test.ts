@@ -377,11 +377,12 @@ test("full flow: prefer routing + quant + default → -plus provider name, setti
 
     await started;
     assert.ok(h.notifications.every((n) => n.type !== "error"), "no errors on the happy path");
+    // Harness pi has no live setModel, so pin reports fileOnly wording.
     assert.deepEqual(
       h.notifications.map((n) => n.message),
       [
         "Pinning z-ai/glm-5.2 → openrouter-novita-plus…",
-        "Pinned openrouter-novita-plus/z-ai/glm-5.2 and set as default.",
+        "Pinned openrouter-novita-plus/z-ai/glm-5.2 and set as default (applies on /reload or next session).",
       ],
     );
 

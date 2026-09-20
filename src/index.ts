@@ -26,7 +26,15 @@ import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient } from ".
 import { readAuthJsonSync, registerPinnedProviders, resolveFactoryKey } from "./files.ts";
 import { isHelpRequest, parsePinArgs, PIN_HELP, PINS_HELP, UNPIN_HELP } from "./args.ts";
 import { makePinCompletions } from "./completions.ts";
-import { formatRouting, formatRefreshDiff, listPins, performPin, performUnpin, refreshPinnedModels } from "./commands.ts";
+import {
+  formatRouting,
+  formatRefreshDiff,
+  listPins,
+  performPin,
+  performUnpin,
+  probe,
+  refreshPinnedModels,
+} from "./commands.ts";
 import { providerNameFor } from "./config.ts";
 import { pickFromList } from "./ui.ts";
 import { runWizard } from "./wizard.ts";
@@ -89,7 +97,7 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("openrouter-pin", {
     description:
-      "Pin an OpenRouter model to a specific provider (persistent, models.json). " +
+      "Pin an OpenRouter model to a specific provider (persistent, models.json + startup scope `enabledModels`; enable live via `/scoped-models` or `/reload`). " +
       "No args opens an interactive wizard. With args: /openrouter-pin <model-id> <provider> " +
       "[--quant q] [--name 'Display'] [--default] [--order a,b,c] [--ignore a,b] [--fallback] [--data-collection allow|deny]",
     getArgumentCompletions: (prefix) => pinCompletions(prefix),
@@ -99,7 +107,7 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
         return;
       }
       if (!args.trim()) {
-        await runWizard(modelsPath, settingsPath, pi, ctx.ui, client, ctx.modelRegistry);
+        await runWizard(modelsPath, settingsPath, pi, ctx.ui, client, ctx.modelRegistry, ctx);
         return;
       }
       const parsed = parsePinArgs(args);
@@ -107,19 +115,29 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
         ctx.ui.notify(parsed.error, "error");
         return;
       }
-      await performPin(modelsPath, settingsPath, pi, ctx.ui, client, () =>
-        resolveOpenRouterApiKey(ctx.modelRegistry, providerNameFor(parsed.slug!, parsed)), {
-        modelId: parsed.modelId!,
-        slug: parsed.slug!,
-        quant: parsed.quant,
-        // Empty/quoted-whitespace names fall back to the generated one, same
-        // as the wizard ("Z.ai: GLM 5.2 (novita)") — never a blank picker entry.
-        name: parsed.name?.trim() || undefined,
-        isDefault: parsed.isDefault,
-        allowFallbacks: parsed.allowFallbacks,
-        order: parsed.order,
-        ignore: parsed.ignore,
-        dataCollection: parsed.dataCollection,
+      await performPin({
+        modelsPath,
+        settingsPath,
+        pi,
+        ctx: ctx.ui,
+        client,
+        resolveApiKey: () =>
+          resolveOpenRouterApiKey(ctx.modelRegistry, providerNameFor(parsed.slug!, parsed)),
+        modelRegistry: ctx.modelRegistry,
+        extCtx: ctx,
+        opts: {
+          modelId: parsed.modelId!,
+          slug: parsed.slug!,
+          quant: parsed.quant,
+          // Empty/quoted-whitespace names fall back to the generated one, same
+          // as the wizard ("Z.ai: GLM 5.2 (novita)") — never a blank picker entry.
+          name: parsed.name?.trim() || undefined,
+          isDefault: parsed.isDefault,
+          allowFallbacks: parsed.allowFallbacks,
+          order: parsed.order,
+          ignore: parsed.ignore,
+          dataCollection: parsed.dataCollection,
+        },
       });
     },
   });
@@ -127,7 +145,7 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
   pi.registerCommand("openrouter-unpin", {
     description:
       "Remove an OpenRouter provider pin from models.json. No args picks from existing pins. " +
-      "With args: /openrouter-unpin <model-id> (applies on /reload or next session)",
+      "With args: /openrouter-unpin <model-id> (applies immediately)",
     handler: async (args, ctx: ExtensionCommandContext) => {
       if (isHelpRequest(args)) {
         ctx.ui.notify(UNPIN_HELP, "info");
@@ -151,11 +169,24 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
           }
           modelId = chosen.slice(chosen.indexOf("/") + 1);
         }
-        const outcome = await performUnpin(modelsPath, modelId);
+        // Single capability probe per invocation, then single applier that
+        // handles file write + settings prune + live unregister/re-register.
+        const cap = probe(pi, ctx);
+        const outcome = await performUnpin({
+          modelsPath,
+          settingsPath,
+          pi,
+          modelId,
+          ctx,
+          resolveApiKey: () => resolveOpenRouterApiKey(ctx.modelRegistry),
+        });
+
         if (outcome.status === "no-providers") {
           ctx.ui.notify("No pins found (no providers in models.json)", "info");
         } else if (outcome.status === "not-found") {
           ctx.ui.notify(`No pin for "${modelId}" found (checked openrouter-* providers)`, "info");
+        } else if (cap.canUnregister) {
+          ctx.ui.notify(`Unpinned ${modelId} — removed live, no reload needed.`, "info");
         } else {
           ctx.ui.notify(`Unpinned ${modelId} from models.json (applies on /reload or next session).`, "info");
         }
