@@ -77,7 +77,8 @@ export function readAuthJsonSync(agentDir: string): unknown {
 
 /** Strip JSONC comments and parse as JSON. Throws on malformed input. */
 function parseJsonc<T>(raw: string): T {
-  const stripped = stripJsonComments(raw);
+  const withoutBom = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const stripped = stripJsonComments(withoutBom);
   return JSON.parse(stripped) as T;
 }
 
