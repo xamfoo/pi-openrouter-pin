@@ -285,6 +285,61 @@ test("performUnpin handles null/empty snapshot gracefully", async () => {
   });
 });
 
+test("performPin with unbound setModel (loader stub) degrades to fileOnly", async () => {
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    await atomicWriteJson(modelsPath, { providers: {} });
+    const settingsBefore = { defaultProvider: "openrouter-novita", defaultModel: "z-ai/glm-5.2", enabledModels: ["z-ai/glm-5.2"] };
+    await atomicWriteJson(settingsPath, settingsBefore);
+    const pi = {
+      on: () => {},
+      registerProvider: () => {},
+      registerCommand: () => {},
+      unregisterProvider: () => {},
+      // Loader-only stub: rejects with the same message as discoverAndLoadExtensions
+      setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
+    } as unknown as ExtensionAPI;
+    const notifications: { message: string; type: string }[] = [];
+    const ctx = {
+      mode: "tui" as const,
+      hasUI: true,
+      cwd: "/tmp",
+      modelRegistry: {},
+      model: undefined,
+      scopedModels: [],
+      ui: {
+        notify: (message: string, type: string) => { notifications.push({ message, type }); },
+        select: async () => undefined,
+      },
+    } as unknown as ExtensionCommandContext;
+    await performPin({
+      modelsPath,
+      settingsPath,
+      pi,
+      ctx: ctx.ui,
+      client: {
+        fetchRawModel: async () => ({ id: "z-ai/glm-5.2", name: "GLM 5.2" }),
+        validateEndpoint: async () => ({ status: "ok" as const, endpoint: "https://example.com" }),
+        fetchModelEndpoints: async () => ({ endpoints: [] }),
+      } as any,
+      resolveApiKey: async () => undefined,
+      opts: { modelId: "z-ai/glm-5.2", slug: "novita", isDefault: true } as any,
+    });
+    // settings.json must persist (no rollback on loader-unbound).
+    // performPin adds the enabledModel to enabledModels as part of
+    // the settings patch, so include it in the expected snapshot.
+    const expectedSettings = { ...settingsBefore, enabledModels: [...settingsBefore.enabledModels, "openrouter-novita/z-ai/glm-5.2"] };
+    const settings = await readJsonFile<typeof expectedSettings>(settingsPath);
+    assert.deepEqual(settings, expectedSettings, "settings.json must persist (fileOnly, no rollback)");
+    // No error notifications from the loader-unbound path.
+    assert.ok(notifications.every((n) => n.type !== "error"), `unexpected error notifications: ${JSON.stringify(notifications)}`);
+    // Must have the fileOnly info notification.
+    assert.ok(notifications.some((n) => n.type === "info" && n.message.includes("applies on /reload or next session")),
+      "expected fileOnly notification");
+  });
+});
+
 test("performUnpin not-found never writes files", async () => {
   await withTempDir(async (dir) => {
     const modelsPath = join(dir, "models.json");
