@@ -45,3 +45,47 @@ jobs:
       - run: npm install --no-save "@earendil-works/pi-coding-agent@${{ matrix.pi }}" "@earendil-works/pi-tui@${{ matrix.pi }}"
 
       - run: npm test
+
+  # End-to-end suite against the published package, running in parallel
+  # with `test`/`compat` (no `needs`).  Uses a local `npm pack` tarball
+  # + isolated-prefix install (mirrors `release.yml:e2e` minus the
+  # `publish`/`download-artifact` dependency).
+  # Requires `OPENROUTER_API_KEY` from the `npm-publish` environment;
+  # fork PRs / missing keys degrade to self-skipped green via the
+  # `E2E_ENABLED` gate in `test/e2e.test.ts`.
+  e2e-live:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    environment: npm-publish
+    permissions:
+      contents: read
+    env:
+      CI_E2E: "1"
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pi: ["0.84.1", "0.85.1", "0.86.1", "latest"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org/
+      - run: npm ci
+      - name: Pack tarball locally
+        run: |
+          TARBALL="$(npm pack --json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8'))[0].filename")"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          ls -lh "$TARBALL"
+      - name: Install pi and the tarball pin into an isolated prefix
+        run: |
+          DEPS_DIR="$RUNNER_TEMP/orpin-e2e-deps"
+          mkdir -p "$DEPS_DIR"
+          cd "$DEPS_DIR"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "@earendil-works/pi-coding-agent@${{ matrix.pi }}" "$GITHUB_WORKSPACE/$TARBALL"
+          echo "ORPIN_PKG_DIR=$DEPS_DIR/node_modules/@xamfoo/pi-openrouter-pin" >> "$GITHUB_ENV"
+      - name: Run the end-to-end suite
+        run: node --test --test-concurrency=1 "test/e2e.test.ts"
