@@ -21,6 +21,57 @@ import {
 } from "./config.ts";
 import { atomicWriteJson, readJsonFile, type ModelsJson, type ProviderEntry, type SettingsJson } from "./files.ts";
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** Result of planUnpin: the pure plan values used by the applier. */
+export interface UnpinPlan {
+  /** Providers left with zero models after removal. */
+  emptied: string[];
+  /** Providers with surviving siblings, needing re-registration with the pruned list. */
+  repruned: string[];
+  /** Settings changes to apply (null when nothing changed). */
+  settingsPatch: SettingsPatch | null;
+  /** Model ids removed from models.json. */
+  removed: string[];
+  /** Whether this invocation created the settings file (for rollback). */
+  createdFile: boolean;
+}
+
+/** Settings changes computed by planUnpin or planPin. */
+export interface SettingsPatch {
+  defaultProvider?: string;
+  defaultModel?: string;
+  enabledModel?: string;
+  /** The prior values for rollback. */
+  _before: SettingsBefore;
+}
+
+/** Settings values before a change (for rollback). */
+export interface SettingsBefore {
+  defaultProvider?: string;
+  defaultModel?: string;
+  enabledModels?: string[];
+}
+
+/** Settings before/after comparison result. */
+export interface SettingsDiff {
+  /** Whether the default was cleared (exact match). */
+  defaultCleared: boolean;
+  /** Whether enabledModels was pruned. */
+  enabledPruned: boolean;
+  /** Whether settings.json was actually rewritten. */
+  wrote: boolean;
+}
+
+/** Capability probe result driving live vs fileOnly behavior. */
+export interface CapabilityProbe {
+  canUnregister: boolean;
+  canSetModel: boolean;
+  live: boolean;
+}
+
 export function formatRouting(r: OpenRouterRouting): string {
   const parts: string[] = [];
   if (r.only && r.only.length > 0) parts.push(`only=${r.only.join(",")}`);
@@ -32,15 +83,77 @@ export function formatRouting(r: OpenRouterRouting): string {
   return parts.join(" ");
 }
 
-export async function performPin(
-  modelsPath: string,
-  settingsPath: string,
-  pi: ExtensionAPI,
-  ctx: ExtensionUIContext,
-  client: OpenRouterClient,
-  resolveApiKey: () => Promise<string | undefined>,
-  opts: PinOptions,
-): Promise<void> {
+/**
+ * Pure: plan a pin operation.
+ *
+ * Computes the settings patch and whether the settings file
+ * would be created or rewritten. Never mutates its inputs.
+ */
+export function planPin(
+  models: ModelsJson | null,
+  settings: SettingsJson | null,
+  modelId: string,
+  settingsPatch: { defaultProvider?: string; defaultModel?: string; enabledModel?: string } | undefined,
+): {
+  settingsPatch: SettingsPatch | null;
+  createdFile: boolean;
+  duplicateEnabledModel: boolean;
+} {
+  const createdFile = settings === null;
+  const currentSettings = settings ?? {};
+  const existingEnabled = Array.isArray(currentSettings.enabledModels) ? currentSettings.enabledModels : [];
+
+  if (!settingsPatch) {
+    return { settingsPatch: null, createdFile, duplicateEnabledModel: false };
+  }
+
+  // Check for duplicate enabledModel.
+  const duplicateEnabledModel = existingEnabled.includes(settingsPatch.enabledModel!);
+
+  const patch: SettingsPatch = {
+    _before: {
+      defaultProvider: currentSettings.defaultProvider,
+      defaultModel: currentSettings.defaultModel,
+      enabledModels: [...existingEnabled],
+    },
+  };
+
+  if (settingsPatch.defaultProvider) patch.defaultProvider = settingsPatch.defaultProvider;
+  if (settingsPatch.defaultModel) patch.defaultModel = settingsPatch.defaultModel;
+  if (settingsPatch.enabledModel && !duplicateEnabledModel) {
+    patch.enabledModel = settingsPatch.enabledModel;
+  }
+
+  return { settingsPatch: patch, createdFile, duplicateEnabledModel };
+}
+
+/**
+ * Options-object signature for performPin with live default switch.
+ */
+export interface PerformPinOptions {
+  modelsPath: string;
+  settingsPath: string;
+  pi: ExtensionAPI;
+  ctx: ExtensionUIContext;
+  client: OpenRouterClient;
+  resolveApiKey: () => Promise<string | undefined>;
+  opts: PinOptions;
+  /** For live `setModel` switching (refresh + find). When absent, falls back to fileOnly. */
+  modelRegistry?: { refresh?: () => unknown; find?: (provider: string, modelId: string) => unknown };
+  /** Full ExtensionCommandContext for `ctx.setModel` fallback probing and scope check (`scopedModels`). */
+  extCtx?: unknown;
+}
+
+/**
+ * Reworked performPin with options-object signature, live default switch,
+ * settings rollback on failure, and idempotency (duplicate enabledModels never duplicated).
+ *
+ * On failure of the live switch, restores settings.json to its prior content
+ * (or removes the file only if this invocation created it). The pin itself is kept.
+ */
+export async function performPin(options: PerformPinOptions): Promise<void> {
+  const { modelsPath, settingsPath, pi, ctx, client, resolveApiKey, opts, modelRegistry, extCtx } = options;
+  const cap = probe(pi, extCtx ?? modelRegistry ?? ctx);
   try {
     ctx.notify(`Pinning ${opts.modelId} → ${providerNameFor(opts.slug, opts)}…`, "info");
 
@@ -60,17 +173,12 @@ export async function performPin(
     // Persist to models.json (pi-native, survives restarts & plugin removal).
     const models = (await readJsonFile<ModelsJson>(modelsPath)) ?? { providers: {} };
     models.providers = models.providers ?? {};
-    // The provider name reflects the routing policy (openrouter-<provider> for
-    // strict pins, openrouter-<provider>-plus for relaxed ones), so look up and
-    // write under the SAME name buildPin computes.
     const providerName = providerNameFor(opts.slug, opts);
     const existingEntry = models.providers[providerName];
     const existingModels = existingEntry && Array.isArray(existingEntry.models) ? existingEntry.models : [];
     const built = buildPin(raw, { ...opts, quant: check.quant, endpoint: check.status === "ok" ? check.endpoint : undefined }, existingModels);
-    // Build the entry WITHOUT relying on spread precedence for headers:
-    // `...(existingEntry ?? {})` would re-introduce legacy attribution
-    // headers that stripLegacyAttribution just removed (the conditional
-    // spread of `{}` cannot override an already-spread key).
+    // Intentional inversion: existingEntry after built preserves prior baseUrl/api
+    // (and placeholder retention) while built's models always win.
     const providerEntry: ProviderEntry = {
       ...built.providerEntry,
       ...(existingEntry ?? {}),
@@ -82,37 +190,177 @@ export async function performPin(
     models.providers[built.providerName] = providerEntry;
     await atomicWriteJson(modelsPath, models);
 
-    // Optional: make it the default for future sessions.
+    // Startup scope: any pin should join `enabledModels` when scoping is
+    // active (`scopedModels.length>0`), so `/scoped-models` or `/reload` can
+    // pick it up. No live poke; host owns `setScopedModels`.
+    const scoped = (extCtx as unknown as { scopedModels?: readonly unknown[] } | undefined)?.scopedModels;
+    const isScopeActive = Array.isArray(scoped) && scoped.length > 0;
+    const scopeEnabledModel = `${built.providerName}/${opts.modelId}`;
+
+    // Optional: make it the default for future sessions, or join active scope.
+    let settingsBefore: SettingsJson | null = null;
+    let pinPlan: ReturnType<typeof planPin> | null = null;
+    let settingsWrote = false;
+    let scopeJoined = false;
     if (built.settingsPatch) {
-      const settings = (await readJsonFile<SettingsJson>(settingsPath)) ?? {};
-      settings.defaultProvider = built.settingsPatch.defaultProvider;
-      settings.defaultModel = built.settingsPatch.defaultModel;
-      const enabled = Array.isArray(settings.enabledModels) ? settings.enabledModels : [];
-      if (!enabled.includes(built.settingsPatch.enabledModel)) enabled.push(built.settingsPatch.enabledModel);
-      settings.enabledModels = enabled;
-      await atomicWriteJson(settingsPath, settings);
+      settingsBefore = (await readJsonFile<SettingsJson>(settingsPath)) ?? null;
+      pinPlan = planPin(null, settingsBefore, opts.modelId, built.settingsPatch);
+      if (pinPlan.settingsPatch) {
+        // Single read, single write; avoid TOCTOU double-read.
+        const base = settingsBefore ? { ...settingsBefore } as SettingsJson : ({} as SettingsJson);
+        base.defaultProvider = built.settingsPatch.defaultProvider;
+        base.defaultModel = built.settingsPatch.defaultModel;
+        if (!pinPlan.duplicateEnabledModel) {
+          const enabled = Array.isArray(base.enabledModels) ? [...base.enabledModels] : [];
+          if (!enabled.includes(built.settingsPatch.enabledModel)) enabled.push(built.settingsPatch.enabledModel);
+          base.enabledModels = enabled;
+        }
+        await atomicWriteJson(settingsPath, base);
+        settingsWrote = true;
+        if (isScopeActive && !pinPlan.duplicateEnabledModel) scopeJoined = true;
+      }
+    } else if (isScopeActive) {
+      // Pin without --default should still join active startup scope via file.
+      settingsBefore = (await readJsonFile<SettingsJson>(settingsPath)) ?? null;
+      const base = settingsBefore ? { ...settingsBefore } as SettingsJson : ({} as SettingsJson);
+      const enabled = Array.isArray(base.enabledModels) ? [...base.enabledModels] : [];
+      if (!enabled.includes(scopeEnabledModel)) {
+        enabled.push(scopeEnabledModel);
+        base.enabledModels = enabled;
+        const beforeJson = JSON.stringify(settingsBefore ?? {});
+        const afterJson = JSON.stringify(base);
+        if (beforeJson !== afterJson) {
+          await atomicWriteJson(settingsPath, base);
+          settingsWrote = true;
+        }
+        scopeJoined = true;
+      }
+      pinPlan = null;
     }
 
-    // Register the FULL model list: registerProvider with `models` replaces
-    // all models for the provider, so registering just the new pin would
-    // silently drop previously pinned models from the live registry.
-    // Inject the resolved key live (never persisted to models.json —
-    // the disk invariant keeps "$OPENROUTER_API_KEY" placeholder).
+    // Register the FULL model list.
+    // Inject the resolved key live (never persisted to models.json).
     pi.registerProvider(built.providerName, apiKey ? { ...providerEntry, apiKey } : providerEntry);
 
-    const defaultSuffix = built.settingsPatch ? " and set as default" : "";
-    ctx.notify(`Pinned ${built.providerName}/${opts.modelId}${defaultSuffix}.`, "info");
-    // data_collection is orthogonal to routing; on a strict pin the provider
-    // name shows no trace of it, so say so (covers the wizard and CLI alike;
-    // it also appears as data_collection=… in /openrouter-pins).
+    // Attempt live default switch (only if default was requested).
+    let liveSwitchFailed = false;
+    let liveSwitchSkippedFileOnly = false;
+    if (built.settingsPatch) {
+      if (!cap.canSetModel) {
+        liveSwitchSkippedFileOnly = true;
+      } else {
+        try {
+          // await-agnostic refresh: works for sync void (0.84) and Promise (0.86).
+          const registry: any = modelRegistry;
+          if (registry?.refresh) {
+            const r = registry.refresh();
+            if (r instanceof Promise) await r;
+          }
+          const found = registry?.find ? registry.find(built.providerName, opts.modelId) : undefined;
+          // Determine setModel target: prefer pi, fall back to ctx.
+          const piAny = pi as unknown as Record<string, unknown>;
+          const ctxAny = (extCtx ?? ctx) as unknown as Record<string, unknown>;
+          const setModelFn =
+            typeof piAny.setModel === "function"
+              ? (piAny.setModel as (m: unknown) => unknown)
+              : typeof ctxAny.setModel === "function"
+                ? (ctxAny.setModel as (m: unknown) => unknown)
+                : undefined;
+          if (!setModelFn) {
+            liveSwitchFailed = true;
+          } else {
+            // Old registries may lack `find`; fall back to minimal {provider,id}
+            // shape rather than treating it as a live failure that triggers rollback.
+            const modelArg: unknown = found ?? buildModelObj(built.providerName, opts.modelId);
+            const result: unknown = setModelFn.call((piAny.setModel ? pi : extCtx ?? ctx) as unknown, modelArg as never);
+            const awaited = result instanceof Promise ? await result : result;
+            if (awaited === false) {
+              // pi's setModel returns false when auth is unconfigured – the only
+              // falsy value that signals failure. `undefined`/`void` (old pi sync
+              // success) and truthy values are success.
+              liveSwitchFailed = true;
+            }
+          }
+        } catch {
+          liveSwitchFailed = true;
+        }
+      }
+    }
+
+    if (liveSwitchFailed && built.settingsPatch) {
+      // Rollback settings: restore settingsBefore value (keep pin).
+      if (settingsBefore) {
+        await atomicWriteJson(settingsPath, settingsBefore);
+      } else if (pinPlan?.createdFile) {
+        try {
+          const { rmSync } = await import("node:fs");
+          rmSync(settingsPath);
+        } catch {
+          // Best-effort removal.
+        }
+      } else if (settingsWrote) {
+        // We wrote a new file but had no prior snapshot and pinPlan says not created?
+        // Best-effort: remove if we created it and now rolled back to nothing.
+        try {
+          const cur = await readJsonFile<SettingsJson>(settingsPath);
+          if (!cur || Object.keys(cur).length === 0) {
+            const { rmSync } = await import("node:fs");
+            rmSync(settingsPath);
+          } else if (settingsBefore) {
+            await atomicWriteJson(settingsPath, settingsBefore);
+          }
+        } catch {}
+      }
+      // Re-apply startup scope join so the kept pin remains in enabledModels
+      // even though the default was rolled back. Documented as intentional:
+      // default rollback restores prior defaults but keeps scope membership.
+      if (isScopeActive) {
+        try {
+          const cur = (await readJsonFile<SettingsJson>(settingsPath)) ?? {};
+          const enabled = Array.isArray(cur.enabledModels) ? [...cur.enabledModels] : [];
+          if (!enabled.includes(scopeEnabledModel)) {
+            enabled.push(scopeEnabledModel);
+            (cur as SettingsJson).enabledModels = enabled;
+            await atomicWriteJson(settingsPath, cur);
+          }
+        } catch {}
+      }
+      ctx.notify(`Pin set ${built.providerName}/${opts.modelId} but live switch failed — default rolled back.`, "error");
+      ctx.notify(`Pinned ${built.providerName}/${opts.modelId} (live switch rolled back).`, "info");
+      if (isScopeActive) {
+        ctx.notify(`Pinned ${built.providerName}/${opts.modelId} — enable it under /scoped-models (or /reload) to join live scope.`, "info");
+      }
+      if (check.note) ctx.notify(`Note: ${check.note}`, "warning");
+      return;
+    }
+
+    if (scopeJoined) {
+      const msg = built.settingsPatch
+        ? `Pinned ${built.providerName}/${opts.modelId} and set as default — enable it under /scoped-models (or /reload) to join live scope.`
+        : `Pinned ${built.providerName}/${opts.modelId} — enable it under /scoped-models (or /reload) to join live scope.`;
+      ctx.notify(msg, "info");
+    } else if (liveSwitchSkippedFileOnly && built.settingsPatch) {
+      ctx.notify(`Pinned ${built.providerName}/${opts.modelId} and set as default (applies on /reload or next session).`, "info");
+    } else {
+      const defaultSuffix = built.settingsPatch ? " and set as default" : "";
+      ctx.notify(`Pinned ${built.providerName}/${opts.modelId}${defaultSuffix}.`, "info");
+    }
     if (opts.dataCollection && !opts.allowFallbacks && (opts.order?.length ?? 0) === 0 && (opts.ignore?.length ?? 0) === 0) {
       ctx.notify(`Data collection set to "${opts.dataCollection}"; routing stays strict (only=${slugify(opts.slug)}).`, "info");
     }
-    // The unvalidated arm always carries a note; the ok arm may. Same handling.
     if (check.note) ctx.notify(`Note: ${check.note}`, "warning");
   } catch (err) {
     ctx.notify(`Pin failed: ${err instanceof Error ? err.message : String(err)}`, "error");
   }
+}
+
+/**
+ * Build a minimal model object for setModel fallback when `registry.find`
+ * is unavailable (old pi). New pi `setModel` expects a `Model` from `find`,
+ * but old pi accepted `{provider, id}`.
+ */
+function buildModelObj(provider: string | undefined, modelId: string | undefined): unknown {
+  return { provider: provider ?? "", id: modelId ?? "" };
 }
 
 export async function listPins(modelsPath: string): Promise<Array<{ provider: string; model: ModelConfig }>> {
@@ -162,6 +410,144 @@ export function unpinFromModels(
   return { models: { ...models, providers }, removed };
 }
 
+// ---------------------------------------------------------------------------
+// Pure plan values
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure: plan the unpin operation without side effects.
+ *
+ * Computes which providers will be emptied, which need re-registration,
+ * what settings changes are needed, and whether the settings file was
+ * created by this invocation (for rollback).
+ */
+export function planUnpin(
+  snapshot: ModelsJson | null,
+  settings: SettingsJson | null,
+  modelId: string,
+): UnpinPlan {
+  const emptied: string[] = [];
+  const repruned: string[] = [];
+  const removed: string[] = [];
+
+  const providers: Record<string, ProviderEntry> = {};
+  for (const [name, provider] of Object.entries(snapshot?.providers ?? {})) {
+    if (!name.startsWith(PROVIDER_PREFIX)) {
+      providers[name] = provider;
+      continue;
+    }
+    const list = Array.isArray(provider.models) ? provider.models : [];
+    const next = list.filter((m) => m.id !== modelId);
+    if (next.length === list.length) {
+      providers[name] = provider;
+    } else {
+      removed.push(modelId);
+      if (next.length === 0) {
+        emptied.push(name);
+      } else {
+        repruned.push(name);
+        providers[name] = { ...provider, models: next };
+      }
+    }
+  }
+
+  // Compute settings changes: prune enabledModels, clear default if needed.
+  const settingsPatch = computeSettingsPrune(settings, modelId, emptied);
+
+  return {
+    emptied,
+    repruned,
+    settingsPatch,
+    removed,
+    createdFile: settings === null,
+  };
+}
+
+/**
+ * Pure: compute the settings prune for an unpin.
+ *
+ * - Removes the model from enabledModels (matches bare `modelId` or any
+ *   `provider/modelId` entry, because settings stores `provider/model`).
+ * - If the removed model was the configured default, clears defaultProvider/defaultModel.
+ * - Returns null when nothing changed.
+ */
+export function computeSettingsPrune(
+  settings: SettingsJson | null,
+  modelId: string,
+  _emptiedProviders: string[] = [],
+): SettingsPatch | null {
+  if (!settings) return null;
+
+  const enabled = Array.isArray(settings.enabledModels) ? settings.enabledModels : [];
+  const priorDefaultProvider = settings.defaultProvider;
+  const priorDefaultModel = settings.defaultModel;
+
+  // Prune enabledModels entries referencing the removed model.
+  // Real disk shape is `provider/modelId` (e.g. `openrouter-novita/z-ai/glm-5.2`),
+  // so match bare id or suffix `/${modelId}`.
+  const suffix = `/${modelId}`;
+  const prunedEnabled = enabled.filter((e) => e !== modelId && !e.endsWith(suffix));
+  const enabledPruned = prunedEnabled.length !== enabled.length;
+
+  // Check if the removed model was the configured default.
+  const wasDefault = priorDefaultModel === modelId;
+  const defaultCleared = wasDefault;
+
+  if (!enabledPruned && !defaultCleared) return null;
+
+  const patch: SettingsPatch = {
+    _before: {
+      defaultProvider: priorDefaultProvider,
+      defaultModel: priorDefaultModel,
+      enabledModels: [...enabled],
+    },
+  };
+
+  if (defaultCleared) {
+    // Explicitly present as `undefined` so the applier can distinguish
+    // "clear" from "leave untouched" via `'key' in patch`.
+    patch.defaultProvider = undefined;
+    patch.defaultModel = undefined;
+  }
+  if (enabledPruned) {
+    patch.enabledModel = prunedEnabled.join(",");
+  }
+
+  return patch;
+}
+
+/**
+ * Pure: compute the before/after settings diff for a settings write.
+ *
+ * Returns a SettingsDiff indicating whether the default was cleared,
+ * enabledModels was pruned, and whether the settings.json was rewritten.
+ */
+export function computeSettingsDiff(
+  before: SettingsJson | null,
+  after: SettingsJson | null,
+): SettingsDiff {
+  const beforeDefaultProvider = before?.defaultProvider;
+  const afterDefaultProvider = after?.defaultProvider;
+  const beforeDefaultModel = before?.defaultModel;
+  const afterDefaultModel = after?.defaultModel;
+  const beforeEnabled = Array.isArray(before?.enabledModels) ? before.enabledModels : [];
+  const afterEnabled = Array.isArray(after?.enabledModels) ? after.enabledModels : [];
+
+  const defaultCleared =
+    beforeDefaultProvider !== undefined && afterDefaultProvider === undefined &&
+    beforeDefaultModel !== undefined && afterDefaultModel === undefined;
+  const enabledPruned =
+    beforeEnabled.length > afterEnabled.length &&
+    afterEnabled.every((e) => beforeEnabled.includes(e));
+  const wrote = JSON.stringify(before) !== JSON.stringify(after);
+
+  return { defaultCleared, enabledPruned, wrote };
+}
+
+// ---------------------------------------------------------------------------
+// Unpin outcome and applier
+// ---------------------------------------------------------------------------
+
 /** Result of /openrouter-unpin: three explicit arms, each with its own notice. */
 export type UnpinOutcome =
   | { status: "removed" }
@@ -169,18 +555,141 @@ export type UnpinOutcome =
   | { status: "not-found" }; // providers exist, but the model is not pinned
 
 /**
+ * Options-object signature for performUnpin with live capability.
+ */
+export interface PerformUnpinOptions {
+  modelsPath: string;
+  settingsPath: string;
+  pi: ExtensionAPI;
+  modelId: string;
+  /** For live reprune: inject resolved key into re-registered providers. */
+  resolveApiKey?: () => Promise<string | undefined>;
+  /** Full command context for probe fallback (e.g. ctx.setModel). */
+  ctx?: unknown;
+}
+
+/**
  * Edge: read models.json, unpin the model from every openrouter-* provider,
  * and write the pruned file only when something was actually removed. A
  * missing file or a model that is not pinned never creates or rewrites
- * models.json.
+ * models.json. Supports both the legacy `(modelsPath, modelId)` signature
+ * and the options-object live signature.
  */
-export async function performUnpin(modelsPath: string, modelId: string): Promise<UnpinOutcome> {
-  const models = await readJsonFile<ModelsJson>(modelsPath);
-  if (!models?.providers) return { status: "no-providers" };
-  const { models: pruned, removed } = unpinFromModels(models, modelId);
-  if (!removed) return { status: "not-found" };
+export async function performUnpin(
+  modelsPathOrOptions: string | PerformUnpinOptions,
+  modelId?: string,
+): Promise<UnpinOutcome> {
+  // Legacy positional signature: performUnpin(modelsPath, modelId)
+  if (typeof modelsPathOrOptions === "string") {
+    const modelsPath = modelsPathOrOptions;
+    const mid = modelId!;
+    const models = await readJsonFile<ModelsJson>(modelsPath);
+    if (!models?.providers) return { status: "no-providers" };
+    const { models: pruned, removed } = unpinFromModels(models, mid);
+    if (!removed) return { status: "not-found" };
+    await atomicWriteJson(modelsPath, pruned);
+    return { status: "removed" };
+  }
+
+  // Options-object live signature
+  const { modelsPath, settingsPath, pi, modelId: mid, resolveApiKey, ctx } = modelsPathOrOptions;
+  const cap = probe(pi, ctx);
+  const snapshot = await readJsonFile<ModelsJson>(modelsPath);
+  if (!snapshot?.providers) return { status: "no-providers" };
+  const settings = await readJsonFile<SettingsJson>(settingsPath);
+  const plan = planUnpin(snapshot, settings, mid);
+  if (plan.removed.length === 0) return { status: "not-found" };
+
+  // Single owner of models.json write: pruned snapshot derived from plan's base
+  const { models: pruned } = unpinFromModels(snapshot, mid);
   await atomicWriteJson(modelsPath, pruned);
+
+  if (plan.settingsPatch) {
+    await applySettingsPatch(plan.settingsPatch, settingsPath, plan.createdFile);
+  }
+
+  if (cap.canUnregister) {
+    for (const name of plan.emptied) {
+      try {
+        (pi as unknown as { unregisterProvider: (n: string) => void }).unregisterProvider(name);
+      } catch {
+        // Best-effort
+      }
+    }
+    if (plan.repruned.length > 0) {
+      const apiKey = resolveApiKey ? await resolveApiKey().catch(() => undefined) : undefined;
+      for (const name of plan.repruned) {
+        const entry = pruned.providers?.[name];
+        if (entry) {
+          pi.registerProvider(name, apiKey ? { ...entry, apiKey } : entry);
+        }
+      }
+    }
+  }
+
   return { status: "removed" };
+}
+
+/**
+ * Probe pi/ctx for capability to unregister providers and set models live.
+ * Returns { canUnregister, canSetModel, live } — used once per invocation.
+ * `setModel` may live on `pi` or on the command `ctx` depending on pi version.
+ */
+export function probe(pi: ExtensionAPI, ctx?: unknown): CapabilityProbe {
+  const piRec = pi as unknown as Record<string, unknown>;
+  const ctxRec = (ctx ?? {}) as Record<string, unknown>;
+  const canUnregister =
+    typeof piRec.unregisterProvider === "function" ||
+    typeof ctxRec.unregisterProvider === "function";
+  const canSetModel =
+    typeof piRec.setModel === "function" || typeof ctxRec.setModel === "function";
+  return { canUnregister, canSetModel, live: canUnregister || canSetModel };
+}
+
+/**
+ * Apply a settings patch: write the updated settings.json.
+ * If createdFile is true and the patch clears everything, remove the file.
+ * Handles clearing via `'key' in patch` so `undefined` means delete.
+ */
+async function applySettingsPatch(
+  patch: SettingsPatch,
+  settingsPath: string,
+  createdFile: boolean,
+): Promise<void> {
+  const beforeRaw = await readJsonFile<SettingsJson>(settingsPath);
+  const settings: SettingsJson = beforeRaw ? { ...beforeRaw } : {};
+  const beforeJson = JSON.stringify(settings);
+
+  if (Object.prototype.hasOwnProperty.call(patch, "defaultProvider")) {
+    if (patch.defaultProvider === undefined) delete (settings as Record<string, unknown>).defaultProvider;
+    else settings.defaultProvider = patch.defaultProvider;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "defaultModel")) {
+    if (patch.defaultModel === undefined) delete (settings as Record<string, unknown>).defaultModel;
+    else settings.defaultModel = patch.defaultModel;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "enabledModel")) {
+    const enabled = patch.enabledModel ? patch.enabledModel.split(",").filter(Boolean) : [];
+    // Preserve empty array semantics (all pruned) rather than deleting the key;
+    // write-only-on-change below will skip if no actual change.
+    (settings as Record<string, unknown>).enabledModels = enabled;
+    // If the caller wants to truly clear the key when empty, uncomment:
+    // if (enabled.length === 0) delete (settings as Record<string, unknown>).enabledModels;
+  }
+
+  const afterJson = JSON.stringify(settings);
+  if (beforeJson === afterJson) return;
+
+  if (Object.keys(settings).length === 0 && createdFile) {
+    try {
+      const { rmSync } = await import("node:fs");
+      rmSync(settingsPath);
+    } catch {
+      // Best-effort removal.
+    }
+    return;
+  }
+  await atomicWriteJson(settingsPath, settings);
 }
 
 // ---------------------------------------------------------------------------

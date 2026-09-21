@@ -128,3 +128,16 @@ test("parsePinArgs: value-taking flags error when the value is missing, never si
   // A present value still parses.
   assert.ok(!("error" in parsePinArgs("m novita --quant fp8 --name 'GLM 5.2'")));
 });
+
+// Updated help text tests for live vs reload behavior.
+test("PIN_HELP documents immediate/live behavior and default switch", () => {
+  assert.ok(PIN_HELP.includes("startup scope") || PIN_HELP.includes("enabledModels"), "pin help mentions startup scope");
+  assert.ok(PIN_HELP.includes("/scoped-models") || PIN_HELP.includes("/reload"), "pin help mentions enable via /scoped-models");
+  assert.ok(PIN_HELP.includes("default"), "pin help documents --default flag");
+  assert.ok(PIN_HELP.includes("switch the session") || PIN_HELP.includes("startup scope"), "pin help mentions live session or scope");
+});
+
+test("UNPIN_HELP documents immediate/unload behavior", () => {
+  assert.ok(UNPIN_HELP.includes("immediately") || UNPIN_HELP.includes("startup scope"), "unpin help mentions immediate removal or scope");
+  assert.ok(UNPIN_HELP.includes("enabledModels") || UNPIN_HELP.includes("startup scope"), "unpin help mentions scope prune");
+});

@@ -848,6 +848,7 @@ export async function runWizard(
   ctx: ExtensionUIContext,
   client: OpenRouterClient,
   modelRegistry: ModelRegistry,
+  extCtx?: unknown,
 ): Promise<void> {
   try {
     let wizard: WizardComponent | undefined;
@@ -862,10 +863,17 @@ export async function runWizard(
     if (wizard?.backgroundSettled) await wizard.backgroundSettled;
     for (const w of wizard?.warnings ?? []) ctx.notify(w, "warning");
 
-    await performPin(modelsPath, settingsPath, pi, ctx, client, () =>
-      resolveOpenRouterApiKey(modelRegistry, providerNameFor(result.slug, result)),
-      result,
-    );
+    await performPin({
+      modelsPath,
+      settingsPath,
+      pi,
+      ctx,
+      client,
+      resolveApiKey: () => resolveOpenRouterApiKey(modelRegistry, providerNameFor(result.slug, result)),
+      modelRegistry,
+      extCtx: (extCtx as unknown) ?? ctx,
+      opts: result,
+    });
   } catch (err) {
     ctx.notify(`Pin failed: ${err instanceof Error ? err.message : String(err)}`, "error");
   }

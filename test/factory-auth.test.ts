@@ -510,7 +510,7 @@ async function performPinTest(
     },
   } as unknown as ExtensionUIContext;
 
-  await performPin(modelsPath, settingsPath, pi, ctx, client, resolveApiKey, opts);
+  await performPin({ modelsPath, settingsPath, pi, ctx, client, resolveApiKey, opts });
   await rm(dir, { recursive: true, force: true });
   return registered;
 }
