@@ -214,6 +214,9 @@ class CommandHarness {
       modelRegistry: {
         // pi's auth machinery would resolve the env var; return it directly.
         getApiKeyForProvider: async () => process.env.OPENROUTER_API_KEY,
+        // Explicitly returns undefined to exercise buildModelObj() fallback
+        // path (found ?? buildModelObj()).
+        find: () => undefined,
       },
       model: undefined,
       scopedModels: [],

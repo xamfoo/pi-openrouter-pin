@@ -22,6 +22,16 @@ import {
 import { atomicWriteJson, readJsonFile, type ModelsJson, type ProviderEntry, type SettingsJson } from "./files.ts";
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Loader-only stub message from `discoverAndLoadExtensions()` when pi.setModel is an unbound reject.
+ *  Exact match intentional — brittle if pi rewords, but correct for known versions: pi >=0.86
+ *  ships `setModel`, loader-only sessions use a stub that rejects with this string
+ *  (dist/core/extensions/loader.js in pi monorepo). */
+const LOADER_UNBOUND_STUB_MSG = "Extension runtime not initialized";
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -281,8 +291,15 @@ export async function performPin(options: PerformPinOptions): Promise<void> {
               liveSwitchFailed = true;
             }
           }
-        } catch {
-          liveSwitchFailed = true;
+        } catch (err) {
+          // loader-only session: unbound stub rejects before runtime init;
+          // degrade to fileOnly (persist settings, no rollback).
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg === LOADER_UNBOUND_STUB_MSG) {
+            liveSwitchSkippedFileOnly = true;
+          } else {
+            liveSwitchFailed = true;
+          }
         }
       }
     }
