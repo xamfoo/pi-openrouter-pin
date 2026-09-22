@@ -47,11 +47,10 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
   const client = new OpenRouterClient(CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS);
 
   // Factory auth inheritance: re-register pinned OpenRouter providers with
-  // the effective key (env → auth.json → undefined) synchronously, before
-  // registerCommand/on(session_start). No network, no async, never throws.
-  // Missing files are silent; malformed JSON warns. Note: pi loads
-  // models.json itself at startup, so we re-register here to inject the
-  // effective key that pi's own load wouldn't resolve for openrouter-* pins.
+  // the effective key (env → tagged auth.json → undefined) synchronously,
+  // before registerCommand/on(session_start). Supports api_key, oauth,
+  // !command passthrough, and $VAR/${VAR} resolution. No network, no async,
+  // never throws. Missing files are silent; malformed JSON warns.
   registerPinnedProviders(
     pi,
     modelsPath,

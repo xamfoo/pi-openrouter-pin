@@ -285,7 +285,7 @@ describe("real ModelRuntime compatibility", { concurrency: 1 }, () => {
   test("env wins over auth.json", () =>
     withTempDir(async (dir) => {
       await atomicWriteJson(join(dir, "models.json"), pinnedModels);
-      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { key: "sk-auth-file" } }));
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-auth-file" } }));
 
       const runtime = await createRuntimeWithExtension(dir, { effectiveKeyEnv: "  sk-env  " });
 
@@ -361,7 +361,7 @@ describe("real ModelRuntime compatibility", { concurrency: 1 }, () => {
       // intent stays diffable.
       const modelsWithBomAndComments = `\uFEFF// pinned via openrouter-pin\n${JSON.stringify(pinnedModels, null, 2)}`;
       writeFileSync(join(dir, "models.json"), modelsWithBomAndComments);
-      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { key: "sk-bom-test" } }));
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-bom-test" } }));
 
       const runtime = await createRuntimeWithExtension(dir);
 
@@ -381,5 +381,58 @@ describe("real ModelRuntime compatibility", { concurrency: 1 }, () => {
 
       const available = (runtime.getAvailableSnapshot() as SnapshotModel[]).filter((m) => m.provider === PROVIDER);
       assert.equal(available.length, 1, "BOM file pin should be selectable when auth present");
+    }));
+
+  // --- Task 2.2: Real-ModelRuntime OAuth spike ---
+  test("OAuth fixture registers openrouter-decart with :free model via getModel and getAvailableSnapshot", () =>
+    withTempDir(async (dir) => {
+      await atomicWriteJson(join(dir, "models.json"), {
+        providers: {
+          "openrouter-decart": makeProviderEntry([{ ...glmModel, id: "z-ai/glm-5.2:free" }]),
+        },
+      });
+      // OAuth-only auth.json: access redacted, refresh empty, pin present
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "oauth", access: "[redacted]", refresh: "", expires: 9007199254740991 } }));
+
+      const runtime = await createRuntimeWithExtension(dir);
+
+      // The provider must be registered
+      const provider = runtime.getProvider("openrouter-decart");
+      assert.ok(provider, "openrouter-decart provider should be registered");
+
+      // getModel must exist and return the pinned model
+      if (typeof runtime.getModel === "function") {
+        const model = runtime.getModel("openrouter-decart", "z-ai/glm-5.2:free");
+        assert.ok(model, "getModel should return the pinned :free model");
+      }
+
+      // getAvailableSnapshot must contain the :free pin
+      if (typeof runtime.getAvailableSnapshot === "function") {
+        const available = runtime.getAvailableSnapshot() as SnapshotModel[];
+        const pin = available.filter((m) => m.provider === "openrouter-decart");
+        assert.ok(pin.length >= 1, "getAvailableSnapshot() must contain the openrouter-decart :free pin");
+      }
+    }));
+
+  // --- Task 2.3: :free ids verbatim coverage ---
+  test(":free ids are preserved verbatim without thinking-level misparse", () =>
+    withTempDir(async (dir) => {
+      await atomicWriteJson(join(dir, "models.json"), {
+        providers: {
+          "openrouter-decart": makeProviderEntry([{ ...glmModel, id: "z-ai/glm-5.2:free" }]),
+        },
+      });
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-free" } }));
+
+      const runtime = await createRuntimeWithExtension(dir);
+
+      const provider = runtime.getProvider("openrouter-decart");
+      assert.ok(provider, "provider with :free id should be registered");
+
+      if (typeof runtime.getAvailableSnapshot === "function") {
+        const available = runtime.getAvailableSnapshot() as SnapshotModel[];
+        const pin = available.filter((m) => m.provider === "openrouter-decart");
+        assert.equal(pin.length, 1, ":free id must resolve without warning");
+      }
     }));
 });

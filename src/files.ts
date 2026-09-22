@@ -18,20 +18,96 @@ import { PROVIDER_PREFIX, type ModelConfig } from "./config.ts";
 // Auth key resolution
 // ---------------------------------------------------------------------------
 
+/** Shape of a pi-valid api_key credential from auth.json. */
+interface ApiKeyCredential {
+  type: "api_key";
+  key?: string;
+  env?: Record<string, string>;
+}
+
+/** Shape of a pi-valid oauth credential from auth.json. */
+interface OAuthCredential {
+  type: "oauth";
+  access: string;
+  refresh: string;
+  expires: number;
+}
+
+/**
+ * Synchronously resolve a `$VAR` or `${VAR}` template using `credEnv` first,
+ * then `process.env`. `$$` escapes a literal dollar. Unresolvable names stay
+ * literal so pi reports `configured:false` instead of receiving a wrong key.
+ */
+function resolveTemplate(input: string, credEnv: Record<string, string> | undefined): string {
+  let out = "";
+  let i = 0;
+  while (i < input.length) {
+    const c = input[i];
+    if (c === "$" && i + 1 < input.length) {
+      const next = input[i + 1];
+      if (next === "$") {
+        out += "$";
+        i += 2;
+        continue;
+      }
+      if (next === "{") {
+        const close = input.indexOf("}", i + 2);
+        if (close !== -1) {
+          const varName = input.slice(i + 2, close);
+          const resolved =
+            credEnv?.[varName] ?? process.env[varName];
+          if (resolved !== undefined) {
+            out += resolved;
+          } else {
+            // Unresolvable: keep literal
+            out += input.slice(i, close + 1);
+          }
+          i = close + 1;
+          continue;
+        }
+      }
+      // `$VAR` (no braces)
+      const rest = input.slice(i + 1);
+      const match = rest.match(/^[A-Za-z_][A-Za-z0-9_]*/);
+      if (match) {
+        const varName = match[0];
+        const resolved = credEnv?.[varName] ?? process.env[varName];
+        if (resolved !== undefined) {
+          out += resolved;
+        } else {
+          // Unresolvable: keep literal
+          out += "$" + varName;
+        }
+        i += 1 + varName.length;
+        continue;
+      }
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
 /**
  * Resolve the effective OpenRouter API key from env and a parsed auth object.
  *
  * Priority:
  *   1. trim(envVal) if non-empty after trim
- *   2. trim(auth.openrouter.key) if it is a non-empty string
- *   3. undefined
+ *   2. Tagged credential:
+ *      - `type:"oauth"` → trimmed `access` (regardless of `expires`/`refresh`)
+ *      - `type:"api_key"` → `$VAR`/`${VAR}` resolved via `credential.env` then
+ *        `process.env`; `!command` passed through literally; `$$` escapes `$`
+ *   3. Untagged leniency: `{key}` string (backwards compat). Untagged `$VAR`
+ *      values are returned literally — the untagged path does not resolve
+ *      templates, matching legacy behavior. Use tagged `api_key` for $VAR support.
+ *   4. undefined
  *
  * Pure: `envVal` is passed in, never read from `process.env`, so this is
  * testable without mutating the environment.
  *
- * Does NOT interpret $ENV interpolation or !command — those are
- * pin-time ModelRegistry concerns. Whitespace-only values are
- * treated as absent. Non-string values from auth.json are ignored.
+ * Whitespace-only values are treated as absent. Non-string values from
+ * auth.json are ignored. Command credentials are never executed in the
+ * factory — they are passed through literally.
  */
 export function resolveFactoryKey(
   envVal: string | undefined,
@@ -43,14 +119,54 @@ export function resolveFactoryKey(
   if (auth && typeof auth === "object") {
     const authObj = auth as Record<string, unknown>;
     const openrouter = authObj.openrouter as Record<string, unknown> | undefined;
-    const key = openrouter?.key;
-    if (typeof key === "string") {
-      const trimmed = key.trim();
+    if (!openrouter) return undefined;
+
+    // Tagged credential shapes
+    const credType = openrouter.type;
+    if (credType === "oauth") {
+      const access = openrouter.access as string | undefined;
+      if (typeof access === "string") {
+        const trimmed = access.trim();
+        if (trimmed) return trimmed;
+      }
+      return undefined;
+    }
+
+    if (credType === "api_key") {
+      const key = openrouter.key as string | undefined;
+      const credEnv = openrouter.env as Record<string, string> | undefined;
+      // Validate env is a plain string-keyed record before passing to resolveTemplate.
+      const validCredEnv = credEnv !== undefined && isRecordOfStrings(credEnv) ? credEnv : undefined;
+      if (typeof key === "string") {
+        const trimmed = key.trim();
+        if (!trimmed) return undefined;
+        if (trimmed.startsWith("!")) {
+          // Pass through literally — never execute in the factory
+          return trimmed;
+        }
+        return resolveTemplate(trimmed, validCredEnv);
+      }
+      return undefined;
+    }
+
+    // Untagged leniency: legacy {key: ...} shape
+    const legacyKey = openrouter.key;
+    if (typeof legacyKey === "string") {
+      const trimmed = legacyKey.trim();
       if (trimmed) return trimmed;
     }
   }
 
   return undefined;
+}
+
+/** Check that a value is a plain string-keyed record (Record<string, string>). */
+function isRecordOfStrings(value: unknown): value is Record<string, string> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  for (const v of Object.values(value as Record<string, unknown>)) {
+    if (typeof v !== "string") return false;
+  }
+  return true;
 }
 
 /**
