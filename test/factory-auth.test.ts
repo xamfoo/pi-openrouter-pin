@@ -87,6 +87,8 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 // A — Pure table tests
 // ---------------------------------------------------------------------------
 
+// --- Untagged leniency (backwards compat) ---
+
 test("resolveFactoryKey: env wins over auth.json", () => {
   assert.strictEqual(
     resolveFactoryKey("  sk-env  ", { openrouter: { key: "sk-auth" } }),
@@ -129,9 +131,154 @@ test("resolveFactoryKey: malformed auth.json does not throw", () => {
   assert.strictEqual(resolveFactoryKey(undefined, null), undefined);
 });
 
-test("resolveFactoryKey: $ENV and !command are literal strings", () => {
-  assert.strictEqual(resolveFactoryKey("$OTHER_ENV", undefined), "$OTHER_ENV");
-  assert.strictEqual(resolveFactoryKey("!op read secret", undefined), "!op read secret");
+test("resolveFactoryKey: untagged {key} leniency still works", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { key: "  sk-lenient  " } }),
+    "sk-lenient",
+  );
+});
+
+test("resolveFactoryKey: untagged key starting with ! is literal", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { key: "!op read secret" } }),
+    "!op read secret",
+  );
+});
+
+// --- OAuth credential ---
+
+test("resolveFactoryKey: oauth returns trimmed access", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "oauth", access: "  tok-abc  ", refresh: "ref", expires: 9007199254740991 } }),
+    "tok-abc",
+  );
+});
+
+test("resolveFactoryKey: oauth with empty refresh still returns access", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "oauth", access: "tok-abc", refresh: "", expires: 9007199254740991 } }),
+    "tok-abc",
+  );
+});
+
+test("resolveFactoryKey: oauth with expired expires still returns access", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "oauth", access: "tok-abc", refresh: "ref", expires: 0 } }),
+    "tok-abc",
+  );
+});
+
+test("resolveFactoryKey: oauth with missing access returns undefined", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "oauth", access: "", refresh: "ref", expires: 9007199254740991 } }),
+    undefined,
+  );
+});
+
+// --- $VAR / ${VAR} / $$ resolution with tagged api_key ---
+
+test("resolveFactoryKey: tagged api_key with $VAR resolves from credEnv", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "$OPENROUTER_API_KEY", env: { OPENROUTER_API_KEY: "resolved-key" } } }),
+    "resolved-key",
+  );
+});
+
+test("resolveFactoryKey: tagged api_key with ${VAR} resolves from credEnv", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "${OPENROUTER_API_KEY}", env: { OPENROUTER_API_KEY: "resolved-key" } } }),
+    "resolved-key",
+  );
+});
+
+test("resolveFactoryKey: tagged api_key $VAR resolves from process.env when credEnv absent", () => {
+  const saved = process.env.TEST_RESOLVE_VAR;
+  process.env.TEST_RESOLVE_VAR = "from-process-env";
+  try {
+    assert.strictEqual(
+      resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "$TEST_RESOLVE_VAR" } }),
+      "from-process-env",
+    );
+  } finally {
+    if (saved === undefined) delete process.env.TEST_RESOLVE_VAR;
+    else process.env.TEST_RESOLVE_VAR = saved;
+  }
+});
+
+test("resolveFactoryKey: tagged api_key unresolvable $VAR stays literal", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "$UNRESOLVABLE_VAR", env: {} } }),
+    "$UNRESOLVABLE_VAR",
+  );
+});
+
+test("resolveFactoryKey: $$ escapes to literal dollar", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "$${OPENROUTER_API_KEY}", env: { OPENROUTER_API_KEY: "x" } } }),
+    "${OPENROUTER_API_KEY}",
+  );
+});
+
+test("resolveFactoryKey: tagged api_key !command passes through literally", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "!op read openrouter/api-key" } }),
+    "!op read openrouter/api-key",
+  );
+});
+
+test("resolveFactoryKey: tagged api_key whitespace-only key returns undefined", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "   " } }),
+    undefined,
+  );
+});
+
+test("resolveFactoryKey: tagged api_key with env wins over process.env", () => {
+  const saved = process.env.TEST_ENV_PRECEEDENCE;
+  process.env.TEST_ENV_PRECEEDENCE = "process-val";
+  try {
+    assert.strictEqual(
+      resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "$TEST_ENV_PRECEEDENCE", env: { TEST_ENV_PRECEEDENCE: "cred-val" } } }),
+      "cred-val",
+    );
+  } finally {
+    if (saved === undefined) delete process.env.TEST_ENV_PRECEEDENCE;
+    else process.env.TEST_ENV_PRECEEDENCE = saved;
+  }
+});
+
+test("resolveFactoryKey: tagged api_key with non-string key is ignored", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: 123 } }),
+    undefined,
+  );
+});
+
+test("resolveFactoryKey: tagged oauth with non-string access is ignored", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "oauth", access: 123, refresh: "ref", expires: 1 } }),
+    undefined,
+  );
+});
+
+// --- :free id verbatim coverage ---
+
+test("resolveFactoryKey: tagged api_key key is returned literally", () => {
+  assert.strictEqual(
+    resolveFactoryKey(undefined, { openrouter: { type: "api_key", key: "sk-free" } }),
+    "sk-free",
+  );
+});
+
+test("collectPinnedProviders: openrouter-decart with :free model id is valid", () => {
+  const snapshot: ModelsJson = {
+    providers: {
+      "openrouter-decart": makeProviderEntry([glmModel({ id: "z-ai/glm-5.2:free" })]),
+    },
+  };
+  const pinned = collectPinnedProviders(snapshot);
+  assert.strictEqual(pinned.length, 1);
+  assert.strictEqual(pinned[0][0], "openrouter-decart");
 });
 
 test("collectPinnedProviders: only openrouter-* with non-empty models", () => {
@@ -349,7 +496,7 @@ describe("factory repros (PI_CODING_AGENT_DIR serial)", { concurrency: 1 }, () =
   delete process.env.OPENROUTER_API_KEY;
   try {
     const registered = await factoryHarness(async (dir) => {
-      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { key: "sk-auth" } }));
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-auth" } }));
       await atomicWriteJson(join(dir, "models.json"), {
         providers: {
           "openrouter-novita": makeProviderEntry([glmModel()]),
@@ -372,7 +519,7 @@ test("4.2 Factory repro: env wins over auth.json (trimmed)", async () => {
   process.env.OPENROUTER_API_KEY = "  sk-env  ";
   try {
     const registered = await factoryHarness(async (dir) => {
-      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { key: "sk-auth" } }));
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-auth" } }));
       await atomicWriteJson(join(dir, "models.json"), {
         providers: { "openrouter-novita": makeProviderEntry([glmModel()]) },
       });
@@ -388,6 +535,24 @@ test("4.2 Factory repro: env wins over auth.json (trimmed)", async () => {
 test("4.2 Factory repro: whitespace-only env falls back to auth.json", async () => {
   const savedEnv = process.env.OPENROUTER_API_KEY;
   process.env.OPENROUTER_API_KEY = "   ";
+  try {
+    const registered = await factoryHarness(async (dir) => {
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-auth" } }));
+      await atomicWriteJson(join(dir, "models.json"), {
+        providers: { "openrouter-novita": makeProviderEntry([glmModel()]) },
+      });
+    });
+    assert.strictEqual(registered.size, 1);
+    assert.strictEqual(registered.get("openrouter-novita")?.apiKey, "sk-auth");
+  } finally {
+    if (savedEnv === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = savedEnv;
+  }
+});
+
+test("4.2 Factory repro: untagged {key} leniency still works", async () => {
+  const savedEnv = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
   try {
     const registered = await factoryHarness(async (dir) => {
       writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { key: "sk-auth" } }));
@@ -420,7 +585,7 @@ test("4.3 Factory repro: JSONC comments (// and /* */) in models.json still re-r
   delete process.env.OPENROUTER_API_KEY;
   try {
     const registered = await factoryHarness(async (dir) => {
-      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { key: "sk-auth" } }));
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-auth" } }));
       // Write models.json with JSONC comments
       const modelsWithComments =
         '{\n  // This is a comment\n  "providers": {\n    /* comment */ "openrouter-novita": {\n      "baseUrl": "https://openrouter.ai/api/v1",\n      "api": "openai-completions",\n      "apiKey": "$OPENROUTER_API_KEY",\n      "models": [{"id": "z-ai/glm-5.2"}]\n    }\n  }\n}\n';
@@ -459,6 +624,99 @@ test("4.4 Factory repro: malformed files still allow registerCommand (no crash)"
   assert.ok(commands.includes("openrouter-pin"), "openrouter-pin command registered despite malformed files");
   assert.ok(commands.includes("openrouter-unpin"), "openrouter-unpin command registered despite malformed files");
   assert.ok(commands.includes("openrouter-pins"), "openrouter-pins command registered despite malformed files");
+});
+
+test("4.6 Factory repro: tagged api_key credential resolves $VAR", async () => {
+  const savedEnv = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  try {
+    const registered = await factoryHarness(async (dir) => {
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "$OPENROUTER_API_KEY", env: { OPENROUTER_API_KEY: "sk-resolved-from-cred" } } }));
+      await atomicWriteJson(join(dir, "models.json"), {
+        providers: { "openrouter-novita": makeProviderEntry([glmModel()]) },
+      });
+    });
+    assert.strictEqual(registered.size, 1);
+    assert.strictEqual(registered.get("openrouter-novita")?.apiKey, "sk-resolved-from-cred");
+  } finally {
+    if (savedEnv === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = savedEnv;
+  }
+});
+
+test("4.7 Factory repro: !command passes through literally without exec", async () => {
+  const savedEnv = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  try {
+    const registered = await factoryHarness(async (dir) => {
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "!op read openrouter/api-key" } }));
+      await atomicWriteJson(join(dir, "models.json"), {
+        providers: { "openrouter-novita": makeProviderEntry([glmModel()]) },
+      });
+    });
+    assert.strictEqual(registered.size, 1);
+    assert.strictEqual(registered.get("openrouter-novita")?.apiKey, "!op read openrouter/api-key");
+  } finally {
+    if (savedEnv === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = savedEnv;
+  }
+});
+
+test("4.8 Factory repro: oauth credential uses access token", async () => {
+  const savedEnv = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  try {
+    const registered = await factoryHarness(async (dir) => {
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "oauth", access: "tok-oauth", refresh: "", expires: 9007199254740991 } }));
+      await atomicWriteJson(join(dir, "models.json"), {
+        providers: { "openrouter-novita": makeProviderEntry([glmModel()]) },
+      });
+    });
+    assert.strictEqual(registered.size, 1);
+    assert.strictEqual(registered.get("openrouter-novita")?.apiKey, "tok-oauth");
+  } finally {
+    if (savedEnv === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = savedEnv;
+  }
+});
+
+test("4.9 Factory repro: oauth with empty refresh still registers", async () => {
+  const savedEnv = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  try {
+    const registered = await factoryHarness(async (dir) => {
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "oauth", access: "tok-oauth", refresh: "", expires: 9007199254740991 } }));
+      await atomicWriteJson(join(dir, "models.json"), {
+        providers: { "openrouter-novita": makeProviderEntry([glmModel()]) },
+      });
+    });
+    assert.strictEqual(registered.size, 1);
+    assert.strictEqual(registered.get("openrouter-novita")?.apiKey, "tok-oauth");
+  } finally {
+    if (savedEnv === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = savedEnv;
+  }
+});
+
+test("4.10 Factory repro: :free model id preserved verbatim in registerProvider", async () => {
+  const savedEnv = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  try {
+    const registered = await factoryHarness(async (dir) => {
+      writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-free-key" } }));
+      await atomicWriteJson(join(dir, "models.json"), {
+        providers: {
+          "openrouter-decart": makeProviderEntry([glmModel({ id: "z-ai/glm-5.2:free" })]),
+        },
+      });
+    });
+    assert.strictEqual(registered.size, 1);
+    assert.ok(registered.has("openrouter-decart"));
+    assert.strictEqual(registered.get("openrouter-decart")?.apiKey, "sk-free-key");
+  } finally {
+    if (savedEnv === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = savedEnv;
+  }
 });
 }); // end factory repros (PI_CODING_AGENT_DIR serial)
 
@@ -588,7 +846,7 @@ test("performPin: persisted models.json keeps $OPENROUTER_API_KEY placeholder (n
 describe("stretch factory repros (PI_CODING_AGENT_DIR serial)", { concurrency: 1 }, () => {
 test("5.1 openrouter-preset is re-registered via prefix rule", async () => {
   const registered = await factoryHarness(async (dir) => {
-    writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { key: "sk-auth" } }));
+    writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-auth" } }));
     await atomicWriteJson(join(dir, "models.json"), {
       providers: {
         "openrouter-preset": makeProviderEntry([glmModel()]),
@@ -631,17 +889,19 @@ test("5.2 Startup perf: factory with 20 pins completes in <50ms", async () => {
 
 test("5.3 Multi-pin mixed-validity: only openrouter-* with models re-registered", async () => {
   const registered = await factoryHarness(async (dir) => {
-    writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { key: "sk-auth" } }));
+    writeFileSync(join(dir, "auth.json"), JSON.stringify({ openrouter: { type: "api_key", key: "sk-auth" } }));
     await atomicWriteJson(join(dir, "models.json"), {
       providers: {
         "anthropic": makeProviderEntry([glmModel()]),
         "openrouter-novita": makeProviderEntry([glmModel()]),
         "openrouter-empty": { ...makeProviderEntry([]), models: [] },
+        "openrouter-decart": makeProviderEntry([glmModel({ id: "z-ai/glm-5.2:free" })]),
       },
     });
   });
-  assert.strictEqual(registered.size, 1);
+  assert.strictEqual(registered.size, 2);
   assert.ok(registered.has("openrouter-novita"));
+  assert.ok(registered.has("openrouter-decart"));
 });
 }); // end stretch factory repros (PI_CODING_AGENT_DIR serial)
 

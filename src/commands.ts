@@ -399,13 +399,20 @@ export async function listPins(modelsPath: string): Promise<Array<{ provider: st
 /**
  * Pure: remove a model id from every openrouter-* provider in a models.json
  * snapshot. Providers left with zero models are dropped entirely;
- * non-openrouter providers are never touched. Returns the pruned snapshot
- * and whether anything was removed. Never mutates its input.
+ * non-openrouter providers are never touched. Accepts an optional pre-built
+ * `knownBareIds` set — when supplied (from a caller that already scanned the
+ * same snapshot), avoids redundant iteration.
+ * Returns the pruned snapshot and whether anything was removed.
+ * Never mutates its input.
  */
 export function unpinFromModels(
   models: ModelsJson | null,
   modelId: string,
+  knownBareIds?: ReadonlySet<string>,
 ): { models: ModelsJson; removed: boolean } {
+  // Use caller-supplied set or build one from scratch via the shared helper.
+  const known = knownBareIds ?? collectKnownBareIds(models?.providers);
+  const normalized = normalizeUnpinArg(modelId, known);
   const providers: Record<string, ProviderEntry> = {};
   let removed = false;
   for (const [name, provider] of Object.entries(models?.providers ?? {})) {
@@ -414,7 +421,7 @@ export function unpinFromModels(
       continue;
     }
     const list = Array.isArray(provider.models) ? provider.models : [];
-    const next = list.filter((m) => m.id !== modelId);
+    const next = list.filter((m) => m.id !== normalized);
     if (next.length === list.length) {
       providers[name] = provider;
     } else {
@@ -434,15 +441,18 @@ export function unpinFromModels(
 /**
  * Pure: plan the unpin operation without side effects.
  *
- * Computes which providers will be emptied, which need re-registration,
- * what settings changes are needed, and whether the settings file was
- * created by this invocation (for rollback).
+ * Accepts an optional pre-built `knownBareIds` set — when supplied (from a
+ * caller that already scanned the same snapshot), avoids redundant iteration.
  */
 export function planUnpin(
   snapshot: ModelsJson | null,
   settings: SettingsJson | null,
   modelId: string,
+  knownBareIds?: ReadonlySet<string>,
 ): UnpinPlan {
+  // Use caller-supplied set or build one from scratch via the shared helper.
+  const known = knownBareIds ?? collectKnownBareIds(snapshot?.providers);
+  const normalized = normalizeUnpinArg(modelId, known);
   const emptied: string[] = [];
   const repruned: string[] = [];
   const removed: string[] = [];
@@ -454,11 +464,11 @@ export function planUnpin(
       continue;
     }
     const list = Array.isArray(provider.models) ? provider.models : [];
-    const next = list.filter((m) => m.id !== modelId);
+    const next = list.filter((m) => m.id !== normalized);
     if (next.length === list.length) {
       providers[name] = provider;
     } else {
-      removed.push(modelId);
+      removed.push(normalized);
       if (next.length === 0) {
         emptied.push(name);
       } else {
@@ -469,7 +479,7 @@ export function planUnpin(
   }
 
   // Compute settings changes: prune enabledModels, clear default if needed.
-  const settingsPatch = computeSettingsPrune(settings, modelId, emptied);
+  const settingsPatch = computeSettingsPrune(settings, normalized, emptied);
 
   return {
     emptied,
@@ -567,9 +577,17 @@ export function computeSettingsDiff(
 
 /** Result of /openrouter-unpin: three explicit arms, each with its own notice. */
 export type UnpinOutcome =
-  | { status: "removed" }
+  | {
+      /** Action succeeded — provider dropped or pruned. */
+      status: "removed";
+      // Internal: handler uses for notice echo; not advertised as a stable contract.
+      resolvedModelId: string;
+    }
   | { status: "no-providers" } // models.json missing, or has no providers key
-  | { status: "not-found" }; // providers exist, but the model is not pinned
+  | {
+      status: "not-found";
+      inputModelId?: string; // Internal: echo original input in not-found notice.
+    };
 
 /**
  * Options-object signature for performUnpin with live capability.
@@ -602,10 +620,14 @@ export async function performUnpin(
     const mid = modelId!;
     const models = await readJsonFile<ModelsJson>(modelsPath);
     if (!models?.providers) return { status: "no-providers" };
-    const { models: pruned, removed } = unpinFromModels(models, mid);
-    if (!removed) return { status: "not-found" };
+    // Single scan from one snapshot: collect bare ids, normalize, apply.
+    const known = collectKnownBareIds(models.providers);
+    const normalized = normalizeUnpinArg(mid, known);
+    // Thread the pre-built set so unpinFromModels skips its own scan.
+    const { models: pruned, removed } = unpinFromModels(models, mid, known);
+    if (!removed) return { status: "not-found", inputModelId: mid };
     await atomicWriteJson(modelsPath, pruned);
-    return { status: "removed" };
+    return { status: "removed", resolvedModelId: normalized };
   }
 
   // Options-object live signature
@@ -613,12 +635,16 @@ export async function performUnpin(
   const cap = probe(pi, ctx);
   const snapshot = await readJsonFile<ModelsJson>(modelsPath);
   if (!snapshot?.providers) return { status: "no-providers" };
+  // Single scan: collect bare ids once and thread through both pure helpers.
+  const known = collectKnownBareIds(snapshot.providers);
+  const normalized = normalizeUnpinArg(mid, known);
   const settings = await readJsonFile<SettingsJson>(settingsPath);
-  const plan = planUnpin(snapshot, settings, mid);
-  if (plan.removed.length === 0) return { status: "not-found" };
+  // Pass the pre-built set so planUnpin/unpinFromModels skip their own scans.
+  const plan = planUnpin(snapshot, settings, mid, known);
+  if (plan.removed.length === 0) return { status: "not-found", inputModelId: mid };
 
   // Single owner of models.json write: pruned snapshot derived from plan's base
-  const { models: pruned } = unpinFromModels(snapshot, mid);
+  const { models: pruned } = unpinFromModels(snapshot, mid, known);
   await atomicWriteJson(modelsPath, pruned);
 
   if (plan.settingsPatch) {
@@ -644,7 +670,7 @@ export async function performUnpin(
     }
   }
 
-  return { status: "removed" };
+  return { status: "removed", resolvedModelId: normalized };
 }
 
 /**
@@ -963,4 +989,38 @@ export function rankModelsForQuery(models: RawModel[], query: string): RawModel[
   if (rest.length === 0) return [...exact, ...prefix];
   const fuzzy = fuzzyFilter(rest, trimmed, (m) => `${m.id} ${m.name ?? ""}`);
   return [...exact, ...prefix, ...fuzzy];
+}
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/** Build a set of all bare model ids from every provider in a models.json snapshot. */
+function collectKnownBareIds(providers: ModelsJson["providers"]): Set<string> {
+  const ids = new Set<string>();
+  for (const [, provider] of Object.entries(providers ?? {})) {
+    for (const m of Array.isArray(provider?.models) ? provider.models : []) {
+      ids.add(m.id);
+    }
+  }
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
+// Normalization
+// ---------------------------------------------------------------------------
+
+export function normalizeUnpinArg(input: string, knownBareIds: ReadonlySet<string>): string {
+  const prefixIndex = input.indexOf('/');
+  if (prefixIndex <= 0) {
+    return input;
+  }
+  const prefix = input.slice(0, prefixIndex);
+  // Match openrouter-<slug>/ where slug may contain lowercase letters, digits,
+  // hyphens (e.g. z-ai, google-vertex), underscores, or a trailing -plus
+  // for relaxed pins.
+  if (!/^openrouter-[a-z0-9-]+(-plus)?$/i.test(prefix)) {
+    return input;
+  }
+  const candidate = input.slice(prefixIndex + 1);
+  return knownBareIds.has(candidate) ? candidate : input;
 }

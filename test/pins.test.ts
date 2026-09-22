@@ -41,6 +41,7 @@ import {
   formatRefreshDiff,
   formatRouting,
   listPins,
+  normalizeUnpinArg,
   planPin,
   planUnpin,
   performPin,
@@ -290,7 +291,10 @@ test("performUnpin: removes and writes only when something was removed", async (
   await withTempModels(
     { providers: { "openrouter-novita": providerEntry([glmModel(), deepseekModel()]) } },
     async (modelsPath) => {
-      assert.deepEqual(await performUnpin(modelsPath, "z-ai/glm-5.2"), { status: "removed" });
+      assert.deepEqual(await performUnpin(modelsPath, "z-ai/glm-5.2"), {
+        status: "removed",
+        resolvedModelId: "z-ai/glm-5.2",
+      });
       const models = await readJsonFile<ModelsJson>(modelsPath);
       assert.deepEqual(
         models!.providers!["openrouter-novita"].models.map((m) => m.id),
@@ -299,7 +303,10 @@ test("performUnpin: removes and writes only when something was removed", async (
       );
 
       // A second unpin of the last model drops the whole provider.
-      assert.deepEqual(await performUnpin(modelsPath, "deepseek/deepseek-v4-flash-0731"), { status: "removed" });
+      assert.deepEqual(
+        await performUnpin(modelsPath, "deepseek/deepseek-v4-flash-0731"),
+        { status: "removed", resolvedModelId: "deepseek/deepseek-v4-flash-0731" },
+      );
       assert.deepEqual(await readJsonFile<ModelsJson>(modelsPath), { providers: {} });
     },
   );
@@ -309,7 +316,10 @@ test("performUnpin: not-found and no-providers never write", async () => {
   await withTempModels(
     { providers: { "openrouter-novita": providerEntry([glmModel()]) } },
     async (modelsPath) => {
-      assert.deepEqual(await performUnpin(modelsPath, "nobody/home"), { status: "not-found" });
+      assert.deepEqual(await performUnpin(modelsPath, "nobody/home"), {
+        status: "not-found",
+        inputModelId: "nobody/home",
+      });
       const after = await readJsonFile<ModelsJson>(modelsPath);
       assert.deepEqual(after!.providers!["openrouter-novita"].models.map((m) => m.id), ["z-ai/glm-5.2"]);
     },
@@ -1190,14 +1200,486 @@ test("/openrouter-unpin <model>: live policy emits live notice when pi supports 
   });
 });
 
-test("/openrouter-unpin <model>: not-found produces info notice, file untouched", async () => {
+// ---------------------------------------------------------------------------
+// G — Qualified-to-bare normalization
+// ---------------------------------------------------------------------------
+
+test("normalizeUnpinArg: bare id passes through unchanged", () => {
+  const known = new Set(["z-ai/glm-5.2", "z-ai/glm-5.2:free"]);
+  assert.equal(normalizeUnpinArg("z-ai/glm-5.2", known), "z-ai/glm-5.2");
+  assert.equal(normalizeUnpinArg("z-ai/glm-5.2:free", known), "z-ai/glm-5.2:free");
+  assert.equal(normalizeUnpinArg("deepseek/deepseek-v4-flash-0731", known), "deepseek/deepseek-v4-flash-0731");
+});
+
+test("normalizeUnpinArg: qualified strict → bare when remainder matches", () => {
+  const known = new Set(["z-ai/glm-5.2", "z-ai/glm-5.2:free"]);
+  assert.equal(normalizeUnpinArg("openrouter-decart/z-ai/glm-5.2", known), "z-ai/glm-5.2");
+  assert.equal(normalizeUnpinArg("openrouter-decart/z-ai/glm-5.2:free", known), "z-ai/glm-5.2:free");
+  assert.equal(normalizeUnpinArg("openrouter-novita/deepseek/deepseek-v4-flash-0731", new Set(["deepseek/deepseek-v4-flash-0731"])), "deepseek/deepseek-v4-flash-0731");
+});
+
+test("normalizeUnpinArg: qualified -plus → bare when remainder matches", () => {
+  const known = new Set(["z-ai/glm-5.2", "z-ai/glm-5.2:free"]);
+  assert.equal(normalizeUnpinArg("openrouter-decart-plus/z-ai/glm-5.2", known), "z-ai/glm-5.2");
+  assert.equal(normalizeUnpinArg("openrouter-decart-plus/z-ai/glm-5.2:free", known), "z-ai/glm-5.2:free");
+});
+
+test("normalizeUnpinArg: hyphenated slugs (reported case) normalize correctly", () => {
+  const knownZai = new Set(["z-ai/glm-5.2", "z-ai/glm-5.2:free"]);
+  // The bug report: openrouter-z-ai was failing because '-' wasn't in the regex.
+  assert.equal(normalizeUnpinArg("openrouter-z-ai/z-ai/glm-5.2", knownZai), "z-ai/glm-5.2");
+  assert.equal(normalizeUnpinArg("openrouter-z-ai/z-ai/glm-5.2:free", knownZai), "z-ai/glm-5.2:free");
+  assert.equal(normalizeUnpinArg("openrouter-z-ai-plus/z-ai/glm-5.2", knownZai), "z-ai/glm-5.2");
+  // google-vertex also has hyphens.
+  const knownVertex = new Set(["google/gemini-2.5-pro"]);
+  assert.equal(
+    normalizeUnpinArg("openrouter-google-vertex/google/gemini-2.5-pro", knownVertex),
+    "google/gemini-2.5-pro",
+  );
+  // Non-matching hyphenated prefix stays verbatim.
+  assert.equal(
+    normalizeUnpinArg("openrouter-z-ai/unknown/model", knownZai),
+    "openrouter-z-ai/unknown/model",
+  );
+});
+
+test("normalizeUnpinArg: unknown input stays verbatim (no false positive)", () => {
+  const known = new Set(["z-ai/glm-5.2"]);
+  assert.equal(normalizeUnpinArg("openrouter-foo/unknown-model", known), "openrouter-foo/unknown-model");
+  // Bare ids not in the set also pass through.
+  assert.equal(normalizeUnpinArg("some/other-model", known), "some/other-model");
+});
+
+test("normalizeUnpinArg: :free kept verbatim (never stripped)", () => {
+  const known = new Set(["z-ai/glm-5.2:free"]);
+  assert.equal(normalizeUnpinArg("z-ai/glm-5.2:free", known), "z-ai/glm-5.2:free");
+  assert.equal(normalizeUnpinArg("openrouter-decart/z-ai/glm-5.2:free", known), "z-ai/glm-5.2:free");
+});
+
+test("unpinFromModels: normalized qualified arg unpins the same model", () => {
+  const input: ModelsJson = {
+    providers: {
+      "openrouter-decart": providerEntry([glmModel({ id: "z-ai/glm-5.2:free" })]),
+    },
+  };
+  // Qualified input should match the bare id stored on disk.
+  const { models, removed } = unpinFromModels(input, "openrouter-decart/z-ai/glm-5.2:free");
+  assert.equal(removed, true);
+  assert.deepEqual(models.providers, {}, "the emptied provider is dropped");
+});
+
+test("unpinFromModels: normalized -plus qualified arg works identically", () => {
+  const input: ModelsJson = {
+    providers: {
+      "openrouter-decart-plus": providerEntry([glmModel({ id: "z-ai/glm-5.2:free" })]),
+    },
+  };
+  const { models, removed } = unpinFromModels(input, "openrouter-decart-plus/z-ai/glm-5.2:free");
+  assert.equal(removed, true);
+  assert.deepEqual(models.providers, {});
+});
+
+test("unpinFromModels: multi-provider same-model removal still works with normalized input", () => {
+  const input: ModelsJson = {
+    providers: {
+      "openrouter-novita": providerEntry([glmModel({ id: "z-ai/glm-5.2:free" })]),
+      "openrouter-together": providerEntry([glmModel({ id: "z-ai/glm-5.2:free", name: "GLM relaxed" })]),
+    },
+  };
+  // Qualified form pointing to novita — both providers drop the model.
+  const { models, removed } = unpinFromModels(input, "openrouter-novita/z-ai/glm-5.2:free");
+  assert.equal(removed, true);
+  assert.deepEqual(models.providers, {}, "both providers dropped");
+});
+
+test("planUnpin: normalized qualified arg plans the same as bare", () => {
+  const snapshot: ModelsJson = {
+    providers: {
+      "openrouter-decart": { baseUrl: "x", api: "y", apiKey: "$OPENROUTER_API_KEY", models: [glmModel({ id: "z-ai/glm-5.2:free" })] },
+    },
+  };
+  const settings: SettingsJson = { defaultProvider: "openrouter-decart", defaultModel: "z-ai/glm-5.2:free", enabledModels: ["openrouter-decart/z-ai/glm-5.2:free"] };
+  const planQualified = planUnpin(snapshot, settings, "openrouter-decart/z-ai/glm-5.2:free");
+  const planBare = planUnpin(snapshot, settings, "z-ai/glm-5.2:free");
+  assert.deepEqual(planQualified, planBare, "qualified and bare produce identical plans");
+});
+
+// ---------------------------------------------------------------------------
+// H — Handler notice echoes bare id (task 2.1)
+// ---------------------------------------------------------------------------
+
+test("/openrouter-unpin <model>: bare-arg echoes bare id in notice", async () => {
   await withAgentDir(async () => {
     const modelsPath = join(process.env.PI_CODING_AGENT_DIR!, "models.json");
     await atomicWriteJson(modelsPath, { providers: { "openrouter-novita": providerEntry([glmModel()]) } });
     const h = new CommandHarness();
-    await h.run("openrouter-unpin", "nobody/home");
-    assert.deepEqual(h.notifications, [
-      { message: 'No pin for "nobody/home" found (checked openrouter-* providers)', type: "info" },
-    ]);
+    await h.run("openrouter-unpin", "z-ai/glm-5.2");
+    const lastNotice = h.notifications[h.notifications.length - 1];
+    assert.ok(lastNotice.message.includes("Unpinned z-ai/glm-5.2"));
+  });
+});
+
+test("/openrouter-unpin <model>: qualified strict arg echoes bare id in notice", async () => {
+  await withAgentDir(async () => {
+    const modelsPath = join(process.env.PI_CODING_AGENT_DIR!, "models.json");
+    await atomicWriteJson(modelsPath, { providers: { "openrouter-decart": providerEntry([glmModel()]) } });
+    const h = new CommandHarness();
+    await h.run("openrouter-unpin", "openrouter-decart/z-ai/glm-5.2");
+    const lastNotice = h.notifications[h.notifications.length - 1];
+    assert.ok(
+      lastNotice.message.includes("Unpinned z-ai/glm-5.2") && !lastNotice.message.includes("openrouter-decart/z-ai/glm-5.2"),
+      "notice echoes bare id, not qualified input",
+    );
+    // The provider should be dropped entirely.
+    const models = await readJsonFile<ModelsJson>(modelsPath);
+    assert.deepEqual(models!.providers, {}, "provider dropped");
+  });
+});
+
+test("/openrouter-unpin <model>: qualified -plus arg echoes bare id in notice", async () => {
+  await withAgentDir(async () => {
+    const modelsPath = join(process.env.PI_CODING_AGENT_DIR!, "models.json");
+    await atomicWriteJson(modelsPath, { providers: { "openrouter-decart-plus": providerEntry([glmModel()]) } });
+    const h = new CommandHarness();
+    await h.run("openrouter-unpin", "openrouter-decart-plus/z-ai/glm-5.2");
+    const lastNotice = h.notifications[h.notifications.length - 1];
+    assert.ok(
+      lastNotice.message.includes("Unpinned z-ai/glm-5.2") && !lastNotice.message.includes("openrouter-decart-plus/z-ai/glm-5.2"),
+      "notice echoes bare id, not qualified input",
+    );
+    const models = await readJsonFile<ModelsJson>(modelsPath);
+    assert.deepEqual(models!.providers, {});
+  });
+});
+
+test("/openrouter-unpin <model>: picker path echoes bare id (unchanged behavior)", async () => {
+  await withAgentDir(async () => {
+    const modelsPath = join(process.env.PI_CODING_AGENT_DIR!, "models.json");
+    await atomicWriteJson(modelsPath, { providers: { "openrouter-decart": providerEntry([glmModel()]) } });
+    const h = new CommandHarness("openrouter-decart/z-ai/glm-5.2");
+    await h.run("openrouter-unpin", "");
+    const lastNotice = h.notifications[h.notifications.length - 1];
+    assert.ok(lastNotice.message.includes("Unpinned z-ai/glm-5.2"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I — Pin-then-unpin-default round-trip (task 2.2)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// J — Event-combination matrix (task 2.3)
+// ---------------------------------------------------------------------------
+
+function createOldShapePi(): ExtensionAPI {
+  return {
+    on: () => {},
+    registerProvider: () => {},
+    registerCommand: () => {},
+  } as unknown as ExtensionAPI;
+}
+
+async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(join(tmpdir(), "or-roundtrip-"));
+  try {
+    return await fn(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("performUnpin after performPin default: bare-id unpin clears defaults and prunes enabledModels", async () => {
+  // Simulate what performPin does when --default is set.
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    await atomicWriteJson(modelsPath, {
+      providers: {
+        "openrouter-decart": providerEntry([glmModel({ id: "z-ai/glm-5.2:free" })]),
+      },
+    });
+    await atomicWriteJson(settingsPath, {
+      defaultProvider: "openrouter-decart",
+      defaultModel: "z-ai/glm-5.2:free",
+      enabledModels: ["openrouter-decart/z-ai/glm-5.2:free"],
+    });
+
+    // Unpin with bare id.
+    const resultBare = await performUnpin({
+      modelsPath,
+      settingsPath,
+      pi: createOldShapePi(),
+      modelId: "z-ai/glm-5.2:free",
+    });
+    assert.equal(resultBare.status, "removed", "bare-id unpin removes the pin");
+
+    const modelsAfter = await readJsonFile<ModelsJson>(modelsPath);
+    assert.deepEqual(modelsAfter!.providers, {}, "provider dropped after unpin");
+
+    const settingsAfter = await readJsonFile<SettingsJson>(settingsPath);
+    assert.equal(
+      settingsAfter!.defaultProvider ?? undefined,
+      undefined,
+      "defaultProvider cleared (via delete)",
+    );
+    assert.equal(
+      settingsAfter!.defaultModel ?? undefined,
+      undefined,
+      "defaultModel cleared (via delete)",
+    );
+    // enabledModels still exists (from prior content), but the entry for our
+    // model was pruned — since there was only one entry it becomes [].
+    // The applier preserves non-default keys, so enabledModels key survives.
+    assert.deepEqual(settingsAfter?.enabledModels, []);
+  });
+});
+
+test("performUnpin after performPin default: qualified-id unpin clears defaults identically", async () => {
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    await atomicWriteJson(modelsPath, {
+      providers: {
+        "openrouter-decart": providerEntry([glmModel({ id: "z-ai/glm-5.2:free" })]),
+      },
+    });
+    await atomicWriteJson(settingsPath, {
+      defaultProvider: "openrouter-decart",
+      defaultModel: "z-ai/glm-5.2:free",
+      enabledModels: ["openrouter-decart/z-ai/glm-5.2:free"],
+    });
+
+    const resultQ = await performUnpin({
+      modelsPath,
+      settingsPath,
+      pi: createOldShapePi(),
+      modelId: "openrouter-decart/z-ai/glm-5.2:free",
+    });
+    assert.equal(resultQ.status, "removed", "qualified-id unpin also removes");
+
+    const modelsAfter = await readJsonFile<ModelsJson>(modelsPath);
+    assert.deepEqual(modelsAfter!.providers, {});
+    const settingsAfter = await readJsonFile<SettingsJson>(settingsPath);
+    assert.equal(settingsAfter!.defaultProvider ?? undefined, undefined);
+    assert.equal(settingsAfter!.defaultModel ?? undefined, undefined);
+    assert.deepEqual(settingsAfter?.enabledModels, []);
+  });
+});
+
+// --- Scenario 1: Strict default sole-model via qualified input, live -----------
+
+test("matrix: strict default sole-model unpinned via qualified (live) clears all", async () => {
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    await atomicWriteJson(modelsPath, {
+      providers: { "openrouter-decart": providerEntry([glmModel({ id: "z-ai/glm-5.2" })]) },
+    });
+    await atomicWriteJson(settingsPath, {
+      defaultProvider: "openrouter-decart",
+      defaultModel: "z-ai/glm-5.2",
+      enabledModels: ["openrouter-decart/z-ai/glm-5.2"],
+    });
+    // New-shape pi has unregister.
+    const piWithUnregister = {
+      on: () => {},
+      registerProvider: () => {},
+      registerCommand: () => {},
+      unregisterProvider: () => {},
+    } as unknown as ExtensionAPI;
+    const result = await performUnpin({
+      modelsPath,
+      settingsPath,
+      pi: piWithUnregister,
+      modelId: "openrouter-decart/z-ai/glm-5.2",
+    });
+    assert.equal(result.status, "removed");
+    const m = await readJsonFile<ModelsJson>(modelsPath);
+    assert.deepEqual(m!.providers, {});
+    const s = await readJsonFile<SettingsJson>(settingsPath);
+    assert.equal(s!.defaultProvider ?? undefined, undefined);
+    assert.equal(s!.defaultModel ?? undefined, undefined);
+  });
+});
+
+// --- Scenario 2: Relaxed non-default sibling-survives via bare input, live -------
+
+test("matrix: relaxed non-default sibling survives (reprune)", async () => {
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    await atomicWriteJson(modelsPath, {
+      providers: {
+        "openrouter-decart-plus": providerEntry([
+          glmModel({ id: "z-ai/glm-5.2" }),
+          deepseekModel(),
+        ]),
+      },
+    });
+    await atomicWriteJson(settingsPath, {
+      defaultProvider: "openrouter-decart", // different provider — not affected
+      defaultModel: "some/other-model",
+      enabledModels: ["openrouter-decart-plus/z-ai/glm-5.2", "openrouter-decart-plus/deepseek/deepseek-v4-flash-0731"],
+    });
+    const piWithUnregister = {
+      on: () => {},
+      registerProvider: () => {},
+      registerCommand: () => {},
+      unregisterProvider: () => {},
+    } as unknown as ExtensionAPI;
+    await performUnpin({
+      modelsPath,
+      settingsPath,
+      pi: piWithUnregister,
+      modelId: "z-ai/glm-5.2",
+    });
+    const m = await readJsonFile<ModelsJson>(modelsPath);
+    assert.ok(
+      m!.providers!["openrouter-decart-plus"].models.map((mm) => mm.id).includes("deepseek/deepseek-v4-flash-0731"),
+      "surviving sibling stays in repruned provider",
+    );
+    // Default untouched because we didn't remove the default model.
+    const s = await readJsonFile<SettingsJson>(settingsPath);
+    assert.equal(s!.defaultModel, "some/other-model");
+  });
+});
+
+// --- Scenario 3: Same model under two providers via qualified input -------------
+
+test("matrix: same model two providers — qualified unpin removes both", async () => {
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    await atomicWriteJson(modelsPath, {
+      providers: {
+        "openrouter-novita": providerEntry([glmModel({ id: "z-ai/glm-5.2" })]),
+        "openrouter-together": providerEntry([glmModel({ id: "z-ai/glm-5.2", name: "GLM relaxed" })]),
+      },
+    });
+    await atomicWriteJson(settingsPath, {
+      defaultProvider: "openrouter-novita",
+      defaultModel: "z-ai/glm-5.2",
+      enabledModels: [
+        "openrouter-novita/z-ai/glm-5.2",
+        "openrouter-together/z-ai/glm-5.2",
+      ],
+    });
+    const result = await performUnpin({
+      modelsPath,
+      settingsPath,
+      pi: createOldShapePi(),
+      modelId: "openrouter-novita/z-ai/glm-5.2",
+    });
+    assert.equal(result.status, "removed");
+    const m = await readJsonFile<ModelsJson>(modelsPath);
+    assert.deepEqual(m!.providers, {}, "both providers dropped");
+    const s = await readJsonFile<SettingsJson>(settingsPath);
+    assert.equal(s!.defaultProvider ?? undefined, undefined, "default cleared");
+    assert.equal(s!.defaultModel ?? undefined, undefined, "defaultModel cleared");
+    assert.deepEqual(s?.enabledModels, [], "all enabled entries pruned");
+  });
+});
+
+// --- Scenario 4: Stale default plus scope-active pin ----------------------------
+
+test("matrix: stale default preserved when scope-active pin removed", async () => {
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    // Settings default points to a DIFFERENT provider (stale).
+    await atomicWriteJson(modelsPath, {
+      providers: {
+        "openrouter-decart": providerEntry([glmModel({ id: "z-ai/glm-5.2" })]),
+        "openrouter-novita": providerEntry([glmModel({ id: "another/model", name: "Other" })]),
+      },
+    });
+    await atomicWriteJson(settingsPath, {
+      defaultProvider: "openrouter-novita", // stale — not the one we're removing
+      defaultModel: "another/model",
+      enabledModels: [
+        "openrouter-decart/z-ai/glm-5.2",
+        "openrouter-novita/another/model",
+      ],
+    });
+    await performUnpin({
+      modelsPath,
+      settingsPath,
+      pi: createOldShapePi(),
+      modelId: "z-ai/glm-5.2",
+    });
+    const m = await readJsonFile<ModelsJson>(modelsPath);
+    assert.ok(!("openrouter-decart" in m!.providers!), "decart provider dropped");
+    assert.ok("openrouter-novita" in m!.providers!, "novita provider survives");
+    const s = await readJsonFile<SettingsJson>(settingsPath);
+    assert.equal(s!.defaultProvider, "openrouter-novita", "stale default preserved");
+    assert.equal(s!.defaultModel, "another/model", "stale defaultModel preserved");
+    assert.ok(!s!.enabledModels!.includes("openrouter-decart/z-ai/glm-5.2"), "removed entry pruned");
+  });
+});
+
+// --- Scenario 5: Missing settings file plus fileOnly host -----------------------
+
+test("matrix: missing settings file + fileOnly — no crash, provider still dropped", async () => {
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    await atomicWriteJson(modelsPath, {
+      providers: { "openrouter-decart": providerEntry([glmModel()]) },
+    });
+    // DO NOT write settings.json.
+    const piWithout = {
+      on: () => {},
+      registerProvider: () => {},
+      registerCommand: () => {},
+      // No unregisterProvider — fileOnly
+    } as unknown as ExtensionAPI;
+    const result = await performUnpin({
+      modelsPath,
+      settingsPath,
+      pi: piWithout,
+      modelId: "z-ai/glm-5.2",
+    });
+    assert.equal(result.status, "removed");
+    const m = await readJsonFile<ModelsJson>(modelsPath);
+    assert.deepEqual(m!.providers, {}, "provider dropped despite no settings file");
+    // No settings file should be created.
+    const { existsSync } = await import("node:fs");
+    assert.equal(existsSync(settingsPath), false, "no settings file created for nothing");
+  });
+});
+
+// --- Scenario 6: Quant and data-collection extras unpinned by id ----------------
+
+test("matrix: quant/data-collection extras unpinned by id alone", async () => {
+  const quantGlm = glmModel({
+    id: "z-ai/glm-5.2",
+    name: "GLM 5.2 FP8 (novita)",
+    compat: {
+      thinkingFormat: "openrouter",
+      openRouterRouting: {
+        only: ["novita"],
+        allow_fallbacks: false,
+        quantizations: ["fp8"],
+        data_collection: "allow",
+      },
+    },
+  });
+  await withTempDir(async (dir) => {
+    const modelsPath = join(dir, "models.json");
+    const settingsPath = join(dir, "settings.json");
+    await atomicWriteJson(modelsPath, {
+      providers: { "openrouter-novita": providerEntry([quantGlm]) },
+    });
+    await atomicWriteJson(settingsPath, {
+      enabledModels: ["openrouter-novita/z-ai/glm-5.2"],
+    });
+    await performUnpin({
+      modelsPath,
+      settingsPath,
+      pi: createOldShapePi(),
+      modelId: "z-ai/glm-5.2",
+    });
+    const m = await readJsonFile<ModelsJson>(modelsPath);
+    assert.deepEqual(m!.providers, {}, "model with routing extras is fully removed");
   });
 });
