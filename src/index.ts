@@ -23,13 +23,18 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient } from "./api.ts";
-import { readAuthJsonSync, registerPinnedProviders, resolveFactoryKey } from "./files.ts";
+import {
+  readAuthJsonSync,
+  registerPinnedProviders,
+  resolveFactoryKey,
+} from "./files.ts";
 import { isHelpRequest, parsePinArgs, PIN_HELP, PINS_HELP, UNPIN_HELP } from "./args.ts";
 import { makePinCompletions } from "./completions.ts";
 import {
   formatRouting,
   formatRefreshDiff,
   listPins,
+  normalizeUnpinArg,
   performPin,
   performUnpin,
   probe,
@@ -168,8 +173,10 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
           }
           modelId = chosen.slice(chosen.indexOf("/") + 1);
         }
-        // Single capability probe per invocation, then single applier that
-        // handles file write + settings prune + live unregister/re-register.
+        // Single read: pass raw modelId through performUnpin which normalizes
+        // internally from one snapshot, returns the resolved bare id in the
+        // outcome. Eliminates the double-read TOCTOU gap that previously
+        // existed between handler-side normalization and core-side matching.
         const cap = probe(pi, ctx);
         const outcome = await performUnpin({
           modelsPath,
@@ -183,11 +190,14 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
         if (outcome.status === "no-providers") {
           ctx.ui.notify("No pins found (no providers in models.json)", "info");
         } else if (outcome.status === "not-found") {
-          ctx.ui.notify(`No pin for "${modelId}" found (checked openrouter-* providers)`, "info");
-        } else if (cap.canUnregister) {
-          ctx.ui.notify(`Unpinned ${modelId} — removed live, no reload needed.`, "info");
+          ctx.ui.notify(`No pin for "${outcome.inputModelId ?? modelId}" found (checked openrouter-* providers)`, "info");
         } else {
-          ctx.ui.notify(`Unpinned ${modelId} from models.json (applies on /reload or next session).`, "info");
+          const bareModelId = outcome.resolvedModelId;
+          if (cap.canUnregister) {
+            ctx.ui.notify(`Unpinned ${bareModelId} — removed live, no reload needed.`, "info");
+          } else {
+            ctx.ui.notify(`Unpinned ${bareModelId} from models.json (applies on /reload or next session).`, "info");
+          }
         }
       } catch (err) {
         ctx.ui.notify(`Unpin failed: ${err instanceof Error ? err.message : String(err)}`, "error");
